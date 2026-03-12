@@ -1,0 +1,2555 @@
+import { onRequest, onCall, HttpsError } from "firebase-functions/v2/https";
+import { defineSecret } from "firebase-functions/params";
+import fetch from "node-fetch";
+import { logger } from "firebase-functions/v2";
+import admin from "firebase-admin";
+import { getFirestore, Firestore } from "firebase-admin/firestore";
+
+admin.initializeApp();
+const db = admin.firestore();
+const firestoreCache = new Map(); 
+const ALLOWED_DATABASES = new Set([ "default", "prod"]);
+
+// const testMigrationDB = new Firestore({
+//   projectId: process.env.GCLOUD_PROJECT,
+//   databaseId: "prod"
+// });
+
+/**
+ * Get or create Firestore client for requested databaseId (safe).
+ * Falls back to admin.firestore() for default if desired.
+ */
+function getFirestoreForDB(databaseId) {
+  const dbId = databaseId || "default";
+
+  if (!ALLOWED_DATABASES.has(dbId)) {
+    throw new Error(`Invalid databaseId: ${dbId}`);
+  }
+
+  // 👉 Use admin.firestore() for default DB
+  if (dbId === "default") {
+    return admin.firestore();
+  }
+
+  // 👉 Use Firestore() constructor only for secondary DBs
+  if (firestoreCache.has(dbId)) return firestoreCache.get(dbId);
+
+  const client = new Firestore({
+    projectId: process.env.GCLOUD_PROJECT,
+    databaseId: dbId,
+  });
+
+  firestoreCache.set(dbId, client);
+  return client;
+}
+
+
+/** 🔹 Helper: Check if link is expired */
+function isLinkExpired(expiryTimestamp) {
+  if (!expiryTimestamp) return false;
+  const now = new Date();
+  const expiry = new Date(expiryTimestamp);
+  logger.info(`⏰ Checking expiry - Now: ${now.toISOString()}, Expiry: ${expiry.toISOString()}`);
+  return now > expiry;
+}
+
+/**
+ * 🔐 candidateSecurityFunctionTest
+ * Two-phase validation:
+ *  1️⃣ Before login — validate job open and valid link.
+ *  2️⃣ After login — validate candidate email, expiry, submission status.
+ */
+export const candidateSecurityFunction = onCall(async (call) => {
+  const { data } = call;
+  const { companyName, jobName, email, checkSubmission, db: databaseId } = data;
+    // ─────────────────────────────────────────────
+  // ✅ STEP 0: Normalize email (CRITICAL FIX)
+  // ─────────────────────────────────────────────
+  const normalizedEmail = (email || "").trim().toLowerCase();
+if (!normalizedEmail) {
+  logger.warn("⚠️ candidateSecurityFunction called without email");
+  return {
+    valid: false,
+    reason: "missing_email",
+    message: "Email not provided yet"
+  };
+}
+  logger.info(`🗄️ Using DB: ${databaseId}`);
+
+     let testMigrationDB;
+  try {
+    testMigrationDB = getFirestoreForDB(databaseId);
+
+  } catch (err) {
+    logger.warn("Invalid DB requested", { databaseId });
+    throw new HttpsError("permission-denied", "Invalid database requested");
+  }
+  if (!companyName || !jobName) {
+    throw new HttpsError("invalid-argument", "Missing companyName or jobName");
+  }
+    logger.info(`Database Name: ${testMigrationDB}`);
+  try {
+    logger.info(`Querying database for: ${companyName}/${jobName}`);
+
+    // ✅ STEP 1️⃣: Check jobClosed
+    const jobDataRef = testMigrationDB
+      .collection(companyName)
+      .doc("Jobs")
+      .collection(jobName)
+      .doc("JD_List");
+
+    const jdDoc = await jobDataRef.get();
+    logger.info(`📂 Checking JD_List path: ${jobDataRef.path} | Exists: ${jdDoc.exists}`);
+
+    if (!jdDoc.exists) {
+      logger.error("❌ JD_List document not found");
+      return { status: "error", message: "Job details not found." };
+    }
+
+    const jobData = jdDoc.data()?.JobData || {};
+    if (jobData.JobClosed === true) {
+      logger.warn("🚫 Job is closed.");
+      return { status: "closed", message: "This job is closed." };
+    }
+
+  // ✅ STEP 2️⃣: Validate Evaluation existence
+ const jobBaseRef = testMigrationDB
+  .collection(companyName)
+  .doc("Jobs")
+  .collection(jobName);
+
+  // ✅ Define jdListRef before using it
+const jdListRef = jobBaseRef.doc("JD_List");
+const jdListDoc = await jdListRef.get();
+
+  if (!jdListDoc.exists) {
+  logger.warn(`❌ Job not found: ${companyName}/${jobName}`);
+  return { status: "error", message: "Job details not found." };
+}
+    
+
+    // // Check old path first
+    // const evalRef  = db 
+    //   .collection(companyName) 
+    //   .doc("Jobs") 
+    //   .collection(jobName) 
+    //   .doc("Evaluation"); 
+
+    const evalRef = jobBaseRef.doc("Evaluation");
+ 
+    
+    // logger.info(`📘 Evaluation document exists: ${evalDoc.exists}`); 
+
+    //   if (!evalDoc.exists) {
+    //   logger.warn("⚠️ EvaluationData missing (mandatory)");
+    //   return { status: "error", message: "Evaluation data not found for this job." };
+    // }
+
+    const evalDoc = await evalRef.get();
+    logger.info(`📘 Evaluation document exists: ${evalDoc.exists}`);
+    const evalData = evalDoc.data() || {};
+
+    let jobExists = false;
+    let candidateFound = false;
+    let candidateData = null;
+
+    // 🔹 Check old path
+    if (evalDoc.exists && evalData.EvaluationData && Array.isArray(evalData.EvaluationData)) {
+      jobExists = true;
+      const candidate = evalData.EvaluationData.find(
+        (c) => c.email?.toLowerCase() === normalizedEmail && c.emailSent === true
+      );
+      if (candidate) {
+        logger.info(`✅ Found candidate ${normalizedEmail} in old path`);
+        candidateFound = true;
+        candidateData = candidate;
+      }
+    }
+
+    // 🔹 Check new batch structure
+    const batchesRef = testMigrationDB
+      .collection(companyName)
+      .doc("Jobs")
+      .collection(jobName)
+      .doc("Evaluation")
+      .collection("Batches");
+
+    const batchesSnapshot = await batchesRef.get();
+    if (batchesSnapshot.size > 0) jobExists = true;
+
+    if (!candidateFound && batchesSnapshot.size > 0) {
+      for (const batchDoc of batchesSnapshot.docs) {
+        const batchId = batchDoc.id;
+        const batchData = batchDoc.data();
+
+        if (batchData?.EvaluationData && Array.isArray(batchData.EvaluationData)) {
+          const candidate = batchData.EvaluationData.find(
+            (c) => c.email?.toLowerCase() === normalizedEmail && c.emailSent === true
+          );
+          if (candidate) {
+            logger.info(`✅ Found candidate ${normalizedEmail} in batch ${batchId}`);
+            candidateFound = true;
+            candidateData = candidate;
+            break;
+          }
+        }
+      }
+    }
+
+// ✅ Allow overrideEmails bypass
+    const overrideEmailsRaw = evalData?.overrideEmails || [];
+    const overrideEmails = overrideEmailsRaw.map(e =>
+      e.toLowerCase().trim()
+    );
+logger.info(`🪄 overrideEmails list: ${JSON.stringify(overrideEmails)}`);
+
+
+// If candidate not found, check overrideEmails list
+if (!candidateFound) {
+  if (Array.isArray(overrideEmails) && overrideEmails.includes(normalizedEmail)) {
+    logger.info(`🪄 ${normalizedEmail} is in overrideEmails, granting temporary access`);
+    candidateFound = true;
+     candidateData = { name: "Override Access",  email: normalizedEmail, };
+
+    // ✅ Create Status doc if missing
+    const sanitizedEmail = normalizedEmail.replaceAll(".", "_");
+    const statusRef = testMigrationDB
+      .collection(companyName)
+      .doc("Jobs")
+      .collection(jobName)
+      .doc("Candidates")
+      .collection(sanitizedEmail)
+      .doc("Status");
+
+    const statusDoc = await statusRef.get();
+    if (!statusDoc.exists) {
+      logger.info(`🆕 Creating initial Status document for override email: ${email}`);
+      await statusRef.set({
+        isInterviewFinished: "False",
+        createdAt: new Date().toISOString(),
+        overrideAccess: true,
+      });
+    }
+  } else {
+    logger.warn(`❌ Unauthorized email: ${email}`);
+    return {
+      valid: false,
+      reason: "unauthorized_email",
+      message: "You are not authorized to access this interview. Please use the same email address where you received the interview invitation.",
+    };
+  }
+}
+
+  // ✅ STEP 5️⃣: Check link expiry — only for Evaluation & Batch candidates
+let expiryTimestamp = jobData?.expiryDate || jobData?.linkExpiryDate;
+
+// Prefer emailTrackingData if available (newer schema)
+if (!expiryTimestamp && candidateData?.emailTrackingData?.sentTimestamp) {
+  const sentTime = candidateData.emailTrackingData.sentTimestamp;
+  // const dayLimit = parseInt(jobData?.InterviewDayLimit || "2", 10);
+  // logger.info(`🕒 Computing expiry using emailTrackingData.sentTimestamp=${sentTime} | InterviewDayLimit=${dayLimit}`);
+  const dayLimit = 50; // ✅ [TEST MODE] Force 50-day expiry
+ logger.info(
+  `🕒 [TEST MODE] Computing expiry using emailEvents | InterviewDayLimit=${dayLimit}`
+);
+
+
+  const expiryDate = new Date(sentTime);
+  expiryDate.setDate(expiryDate.getDate() + dayLimit);
+  expiryTimestamp = expiryDate.toISOString();
+
+  logger.info(`📅 Computed expiryTimestamp from emailTrackingData: ${expiryTimestamp}`);
+}
+
+// Fallback: use older emailEvents if trackingData not available
+if (!expiryTimestamp && candidateData?.emailEvents?.length) {
+  // const dayLimit = parseInt(jobData?.InterviewDayLimit || "2", 10);
+    // logger.info(`🕒 Computing expiry using old emailEvents | InterviewDayLimit=${dayLimit}`);
+    const dayLimit = 50; // ✅ [TEST MODE] Force 50-day expiry
+  logger.info(`🕒 [TEST MODE] Computing expiry using emailTrackingData.sentTimestamp=${sentTime} | InterviewDayLimit=${dayLimit}`);
+
+
+  const sorted = candidateData.emailEvents
+    .filter(e => e.date)
+    .sort((a, b) => new Date(b.date) - new Date(a.date));
+  const lastEmailDateStr = sorted[0]?.date;
+
+  if (lastEmailDateStr) {
+    const expiryDate = new Date(lastEmailDateStr);
+    expiryDate.setDate(expiryDate.getDate() + dayLimit);
+    expiryTimestamp = expiryDate.toISOString();
+    logger.info(`📅 Computed expiryTimestamp from emailEvents: ${expiryTimestamp}`);
+  }
+}
+
+// Final expiry check
+if (expiryTimestamp && isLinkExpired(expiryTimestamp)) {
+  logger.warn(`⏳ Link expired for ${email} (expiryTimestamp=${expiryTimestamp})`);
+  return {
+    valid: false,
+    authorized: false,
+    status: "expired",
+    message: "This interview link has expired. Please contact your recruiter for a new link.",
+  };
+}
+    // ✅ STEP 3️⃣: Check submission status
+    if (checkSubmission) {
+      const sanitizedEmail = normalizedEmail.replaceAll(".", "_");
+      const statusRef = testMigrationDB
+        .collection(companyName)
+        .doc("Jobs")
+        .collection(jobName)
+        .doc("Candidates")
+        .collection(sanitizedEmail)
+        .doc("Status");
+
+      logger.info(`Checking status at: ${statusRef.path}`);
+      const statusDoc = await statusRef.get();
+
+      if (statusDoc.exists) {
+        const hasSubmitted = statusDoc.data()?.isInterviewFinished === "True";
+        if (hasSubmitted) {
+          logger.info(`📘 ${email} already submitted interview`);
+          return {
+            valid: true,
+            authorized: true,
+            hasSubmitted: true,
+            candidateName: candidateData.name || "",
+            companyName,
+            jobName,
+          };
+        }
+      }
+
+      // ✅ No submission yet, continue to interview
+      return {
+        valid: true,
+        authorized: true,
+        hasSubmitted: false,
+        candidateName: candidateData.name || "",
+        companyName,
+        jobName,
+      };
+    }
+
+    // ✅ Default for pre-check
+    return {
+      valid: true,
+      authorized: true,
+      candidateName: candidateData.name || "",
+      companyName,
+      jobName,
+    };
+  } catch (err) {
+    logger.error("Error in function:", err);
+    throw new HttpsError("internal", "Failed to validate candidate");
+  }
+});
+
+
+
+/**
+ * candidateSecurityFunction
+ * Validates interview link and returns job/candidate info.
+ */
+export const candidateSecurityFunctionTest = onCall(async (call) => { 
+  const { data } = call; 
+  const { companyName, jobName, email, checkSubmission } = data; 
+ 
+  if (!companyName || !jobName) { 
+    throw new HttpsError("invalid-argument", "Missing companyName or jobName"); 
+  } 
+ 
+  try { 
+    logger.info(`Querying database for: ${companyName}/${jobName}`); 
+
+
+  const sanitizedEmail = email.replace(/\./g, "_");
+  logger.info(`📧 Sanitized Email: ${sanitizedEmail}`);
+
+    // ✅ STEP 1️⃣: Check jobClosed
+    const jobDataRef = db
+      .collection(companyName)
+      .doc("Jobs")
+      .collection(jobName)
+      .doc("JD_List");
+
+    const jdDoc  = await jobDataRef.get();
+    logger.info(`📂 Checking JD_List path: ${jobDataRef.path} | Exists: ${jdDoc.exists}`);
+
+    if (!jdDoc.exists) {
+      logger.error("❌ JD_List document not found");
+      return { status: "error", message: "Job details not found." };
+    }
+
+    const jdData = jdDoc.data();
+    const jobData = jdData?.JobData || {};
+    logger.info("📋 JobData field content:", jobData);
+
+    if (jobData.JobClosed === true) {
+      logger.warn("🚫 Job is closed.");
+      return { status: "closed", message: "This job is closed." };
+    }
+
+const jobBaseRef = db
+  .collection(companyName)
+  .doc("Jobs")
+  .collection(jobName);
+
+  const jdListDoc = await jdListRef.get();
+
+  if (!jdListDoc.exists) {
+  logger.warn(`❌ Job not found: ${companyName}/${jobName}`);
+  return { status: "error", message: "Job details not found." };
+}
+    
+
+    // // Check old path first
+    // const evalRef  = db 
+    //   .collection(companyName) 
+    //   .doc("Jobs") 
+    //   .collection(jobName) 
+    //   .doc("Evaluation"); 
+
+    const evalRef = jobBaseRef.doc("Evaluation");
+ 
+    const evalDoc = await evalRef.get();  
+    // logger.info(`📘 Evaluation document exists: ${evalDoc.exists}`); 
+
+    //   if (!evalDoc.exists) {
+    //   logger.warn("⚠️ EvaluationData missing (mandatory)");
+    //   return { status: "error", message: "Evaluation data not found for this job." };
+    // }
+
+    const evalData = evalDoc.data();
+
+    // ✅ STEP 3️⃣: Check link expiry
+    const expiryTimestamp = jobData?.expiryDate || jobData?.linkExpiryDate;
+    if (isLinkExpired(expiryTimestamp)) {
+      logger.warn("⏳ Interview link expired");
+      return { status: "expired", message: "This interview link has expired." };
+    }
+
+    // We need to track if the job exists in any structure
+    let jobExists = false;
+    let candidateFound = false;
+    let candidateData = null;
+    
+    // If job exists in old path, check for candidate there
+    if (evalDoc.exists && !isLinkExpired(expiryTimestamp)) {
+      jobExists = true;
+      
+      // Check for email in old path EvaluationData
+      if (email && evalData.EvaluationData && Array.isArray(evalData.EvaluationData)) {
+        logger.info("Checking old path EvaluationData for email");
+        const oldPathData = evalData.EvaluationData;
+        const candidate = oldPathData.find(c => c.email === email && c.emailSent === true);
+        
+        if (candidate) {
+          logger.info(`Found authorized candidate ${email} in old path`);
+          candidateFound = true;
+          candidateData = candidate;
+        } else {
+          logger.info(`Email ${email} not found in old path EvaluationData`);
+        }
+      }
+    }
+    
+    // Check batch structure - ALWAYS do this, even if job exists in old path
+    logger.info("Checking batch structure");
+    
+    const batchesRef = db
+      .collection(companyName)
+      .doc("Jobs")
+      .collection(jobName)
+      .doc("Evaluation")
+      .collection("Batches");
+    
+    const batchesSnapshot = await batchesRef.get();
+    logger.info(`Found ${batchesSnapshot.size} batches`);
+    
+    if (batchesSnapshot.size > 0) {
+      // Job exists in batch structure
+      jobExists = true;
+      
+      // If checking email and not already found in old path
+      if (email && !candidateFound) {
+        logger.info(`Checking batches for email: ${email}`);
+        
+        // Check each batch
+        for (const batchDoc of batchesSnapshot.docs) {
+          const batchId = batchDoc.id;
+          logger.info(`Checking batch: ${batchId}`);
+          
+          const batchData = batchDoc.data();
+          if (batchData && batchData.EvaluationData && Array.isArray(batchData.EvaluationData)) {
+            logger.info(`Batch has ${batchData.EvaluationData.length} candidates`);
+            
+            // Print a few sample candidates to debug
+            const sampleEmails = batchData.EvaluationData
+              .slice(0, Math.min(3, batchData.EvaluationData.length))
+              .map(c => c.email);
+            logger.info(`Sample emails in batch: ${sampleEmails.join(', ')}`);
+            
+            // Check each candidate
+            for (const candidate of batchData.EvaluationData) {
+              logger.info(`Checking candidate: ${candidate.email}, emailSent: ${candidate.emailSent}`);
+              
+              if (candidate.email === email && candidate.emailSent === true) {
+                logger.info(`Found authorized candidate ${email} in batch ${batchId}`);
+                candidateFound = true;
+                candidateData = candidate;
+                break;
+              }
+            }
+            
+            if (candidateFound) break;
+          } else {
+            logger.info(`Batch ${batchId} has no valid EvaluationData array`);
+            if (batchData) {
+              logger.info(`Batch keys: ${Object.keys(batchData).join(', ')}`);
+            }
+          }
+        }
+      }
+    }
+      // Check in BypassedEmails (no emailSent required)
+      if (!candidateFound && evalData?.BypassedEmails && Array.isArray(evalData.BypassedEmails)) {
+      logger.info("🪄 Checking BypassedEmails array");
+      if (evalData.BypassedEmails.includes(email)) {
+        logger.info("✅ Found email in BypassedEmails");
+        candidateFound = true;
+      }
+    }
+   
+    // If job doesn't exist in either structure
+    if (!jobExists) {
+      logger.info("Job not found in any structure");
+      return { valid: false, reason: "job_not_found" };
+    }
+    
+    // If checking email and candidate not found
+    if (email && !candidateFound) {
+      logger.info(`Email ${email} not authorized for this job (not found in any structure)`);
+      return { valid: false, reason: "unauthorized_email" };
+    }
+    
+    // If just validating the job (no email check)
+    if (!email) {
+      logger.info("Job exists, no email check requested");
+      return { valid: true, companyName, jobName };
+    }
+    
+    logger.info(`Email ${email} is authorized for this job`);
+    
+    // If checking submission status
+    if (checkSubmission) {
+      try {
+        const sanitizedEmail = email.replaceAll('.', '_');
+        logger.info("Sanitized email:", sanitizedEmail);
+        
+        const statusRef = db
+          .collection(companyName) 
+          .doc("Jobs") 
+          .collection(jobName) 
+          .doc("Candidates") 
+          .collection(sanitizedEmail)
+          .doc("Status"); 
+        
+        logger.info(`Checking status at: ${statusRef.path}`);
+        
+        const statusDoc = await statusRef.get();
+        logger.info(`Status document exists: ${statusDoc.exists}`);
+        
+        if (statusDoc.exists) {
+          const statusData = statusDoc.data();
+          const hasSubmitted = statusData?.isInterviewFinished === "True";
+          
+          logger.info(`Submission status: ${hasSubmitted}`);
+          
+          return {
+            valid: true,
+            authorized: true,
+            hasSubmitted: hasSubmitted,
+            candidateName: candidateData.name || "",
+            companyName,
+            jobName,
+          };
+        }
+      } catch (statusErr) {
+        logger.error("Error checking submission status:", statusErr);
+      }
+      
+      // If no status found or error
+      return {
+        valid: true,
+        authorized: true,
+        hasSubmitted: false,
+        candidateName: candidateData.name || "",
+        companyName,
+        jobName,
+      };
+    }
+    
+    // Standard authorization response
+    return { 
+      valid: true, 
+      authorized: true, 
+      candidateName: candidateData.name || "", 
+      companyName, 
+      jobName, 
+    };
+  } catch (err) { 
+    logger.error("Error in function:", err); 
+    throw new HttpsError("internal", "Failed to validate candidate"); 
+  } 
+});
+
+
+// Define secret
+const SMTP_KEY = defineSecret("SMTP_KEY");
+
+// Allowed origins
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 
+  "http://localhost:3000, http://localhost:3001, https://neorecruit.web.app, https://neorecruit-admin.web.app, https://neorecruit-admin-stage.web.app, https://neorecruit-stage.web.app, https://neorecruit-admin-stage2.web.app, https://neorecruit-stage2.web.app,  https://neorecruit-hr-admin.web.app, https://neorecruit-admin-test.web.app, https://neorecruit-pentesting-admin.web.app, https://neorecruit-pentesting.web.app, https://neorecruit-talent.web.app, https://neorecruit-build3-talent.web.app, https://neodonya-hr.web.app, https://neodonya-hr-react.web.app, https://neodonya-hr-stage.web.app,https://neodonya-hr-stage2.web.app,https://neodonya-recruit.web.app, https://neodonya-recruit-stage.web.app, https://neodonya-recruit-stage2.web.app, https://neo-test1.web.app,https://neo-test-hr.web.app, https://neo-test-candidate.web.app, https://candidate-neorecruit.web.app")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// Rate limiting storage
+const rateLimitMap = new Map();
+const MAX_ATTEMPTS_PER_MINUTE = 500;
+
+export const sendEmail = onRequest(
+  { maxInstances: 20, secrets: [SMTP_KEY] },
+  async (req, res) => {
+        // --- CORS ---
+    const origin = req.headers.origin;
+    const allowedOriginsStr = process.env.ALLOWED_ORIGINS || 
+      "http://localhost:3000, http://localhost:3001, https://neorecruit.web.app, https://neorecruit-admin.web.app, https://neorecruit-admin-stage.web.app, https://neorecruit-stage.web.app, https://neorecruit-admin-stage2.web.app, https://neorecruit-stage2.web.app,  https://neorecruit-hr-admin.web.app, https://neorecruit-admin-test.web.app, https://neorecruit-pentesting-admin.web.app, https://neorecruit-pentesting.web.app, https://neorecruit-talent.web.app, https://neorecruit-build3-talent.web.app, https://neodonya-hr.web.app, https://neodonya-hr-react.web.app, https://neodonya-hr-stage.web.app,https://neodonya-hr-stage2.web.app,https://neodonya-recruit.web.app, https://neodonya-recruit-stage.web.app, https://neodonya-recruit-stage2.web.app, https://neo-test1.web.app,https://neo-test-hr.web.app, https://neo-test-candidate.web.app, https://candidate-neorecruit.web.app"
+    
+    const allowedOrigins = allowedOriginsStr.split(",").map(s => s.trim()).filter(Boolean);
+    
+    // Explicitly check if origin is allowed
+    if (origin && allowedOrigins.includes(origin)) {
+      res.set("Access-Control-Allow-Origin", origin);
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.set("Access-Control-Allow-Credentials", "true");
+    }
+    
+    // Handle preflight OPTIONS request
+    if (req.method === "OPTIONS") {
+      return res.status(204).send("");
+    }
+
+      try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return sendError(res, origin, 401, "Authentication required");
+      }
+
+      let userId;
+      try {
+        const idToken = authHeader.split("Bearer ")[1];
+        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        userId = decodedToken.uid;
+      } catch (e) {
+        logger.warn("Invalid auth token", e);
+        return sendError(res, origin, 401, "Authentication failed");
+      }
+    // Rate limiting
+    const xff = req.headers['x-forwarded-for'];
+    const clientIP = (xff ? xff.split(',')[0].trim() : req.ip) || 'unknown';
+    const now = Date.now();
+
+    if (!rateLimitMap.has(clientIP)) rateLimitMap.set(clientIP, []);
+    const attempts = rateLimitMap.get(clientIP);
+    const recentAttempts = attempts.filter(time => now - time < 60 * 1000); // 1 min window
+
+    if (recentAttempts.length >= MAX_ATTEMPTS_PER_MINUTE) {
+      logger.warn("Rate limit exceeded", { clientIP });
+      return res.status(429).json({ error: "Too many requests. Please wait a minute." });
+    }
+
+    recentAttempts.push(now);
+    rateLimitMap.set(clientIP, recentAttempts);
+
+    // Occasionally clean up old entries
+    if (Math.random() < 0.1) cleanupRateLimit();
+
+      const smtpKey = SMTP_KEY.value();
+      if (!smtpKey) throw new Error("SMTP_KEY not defined");
+
+      const { to, subject, body, templateId, templateData, sender, cc } = req.body;
+      logger.info("Incoming email request", { clientIP, origin, to, subject, cc, templateId });
+      // Input validation
+      if (!to || !subject || (!body && !templateId)) {
+        return res.status(400).json({ error: "Missing required fields" });
+      }
+      if (typeof subject !== "string" || (body && typeof body !== "string")) {
+        return res.status(400).json({ error: "Invalid input types" });
+      }
+
+      const payload = {
+        sender: sender || "noreply@neodonya.com",
+        to: Array.isArray(to) ? to : [to],
+        subject,
+      };
+      if (cc && cc.length > 0) payload.cc = Array.isArray(cc) ? cc : [cc];
+      if (body) payload.text_body = body;
+      if (templateId && templateData) {
+        payload.template_id = templateId;
+        payload.template_data = templateData;
+      }
+      logger.info("Payload prepared for SMTP2GO", { payload });
+      const response = await fetch("https://api.smtp2go.com/v3/email/send", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Smtp2go-Api-Key": smtpKey,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await response.json();
+      logger.info("SMTP2GO response", { status: response.status, data });
+      const success  = (data?.data?.succeeded ?? 0) > 0;
+      
+      if (!success) {
+        logger.error("Email sending failed", { clientIP, data });
+      } else {
+        logger.info("Email sent successfully", { clientIP, to });
+      }
+
+      return res.status(200).json({
+        success,           
+        succeeded: success,
+        email_id: data?.data?.email_id || null,
+        request_id: data?.request_id || null,
+        details: data,
+      });
+    } catch (err) {
+      logger.error("Email error", { clientIP, error: err.message });
+      return res.status(500).json({ error: "Email failed", details: err.message });
+    }
+  }
+);
+
+// Email Status Tracking Cloud Function
+export const getEmailTrackingStatus = onRequest(
+  { maxInstances: 20, secrets: [SMTP_KEY] },
+  async (req, res) => {
+        // --- CORS ---
+    const origin = req.headers.origin;
+    const allowedOriginsStr = process.env.ALLOWED_ORIGINS || 
+      "http://localhost:3000, http://localhost:3001, https://neorecruit.web.app, https://neorecruit-admin.web.app, https://neorecruit-admin-stage.web.app, https://neorecruit-stage.web.app, https://neorecruit-admin-stage2.web.app, https://neorecruit-stage2.web.app,  https://neorecruit-hr-admin.web.app, https://neorecruit-admin-test.web.app, https://neorecruit-pentesting-admin.web.app, https://neorecruit-pentesting.web.app, https://neorecruit-talent.web.app, https://neorecruit-build3-talent.web.app, https://neodonya-hr.web.app, https://neodonya-hr-react.web.app, https://neodonya-hr-stage.web.app,https://neodonya-hr-stage2.web.app,https://neodonya-recruit.web.app, https://neodonya-recruit-stage.web.app, https://neodonya-recruit-stage2.web.app, https://neo-test1.web.app,https://neo-test-hr.web.app, https://neo-test-candidate.web.app, https://candidate-neorecruit.web.app"
+    
+    const allowedOrigins = allowedOriginsStr.split(",").map(s => s.trim()).filter(Boolean);
+    
+    // Explicitly check if origin is allowe
+    if (origin && allowedOrigins.includes(origin)) {
+      res.set("Access-Control-Allow-Origin", origin);
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.set("Access-Control-Allow-Credentials", "true");
+    }
+    
+    // Handle preflight OPTIONS request
+    if (req.method === "OPTIONS") {
+      return res.status(204).send("");
+    }
+
+      try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return sendError(res, origin, 401, "Authentication required");
+      }
+
+      let userId;
+      try {
+        const idToken = authHeader.split("Bearer ")[1];
+        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        userId = decodedToken.uid;
+      } catch (e) {
+        logger.warn("Invalid auth token", e);
+        return sendError(res, origin, 401, "Authentication failed");
+      }
+
+    // Rate limiting
+    const xff = req.headers['x-forwarded-for'];
+    const clientIP = (xff ? xff.split(',')[0].trim() : req.ip) || 'unknown';
+    const now = Date.now();
+    if (!rateLimitMap.has(clientIP)) rateLimitMap.set(clientIP, []);
+    const attempts = rateLimitMap.get(clientIP);
+    const recentAttempts = attempts.filter(time => now - time < 60 * 1000);
+    if (recentAttempts.length >= MAX_ATTEMPTS_PER_MINUTE) {
+      logger.warn("Rate limit exceeded", { clientIP });
+      return res.status(429).json({ error: "Too many requests. Please wait a minute." });
+    }
+    recentAttempts.push(now);
+    rateLimitMap.set(clientIP, recentAttempts);
+
+      const smtpKey = SMTP_KEY.value();
+      if (!smtpKey) return res.status(500).json({ success: false, error: "SMTP_KEY not configured" });
+
+      const { trackingDataList } = req.body;
+      if (!trackingDataList || !Array.isArray(trackingDataList)) {
+        return res.status(400).json({ error: "Invalid trackingDataList" });
+      }
+
+      const results = [];
+
+      for (const td of trackingDataList) {
+        const recipientEmail = td.recipientEmail || td.email;
+        const emailId = td.emailId;
+
+        if (!recipientEmail) {
+          results.push({ recipientEmail: "unknown", emailId: emailId || null, status: "Error: Invalid Data", events: [] });
+          continue;
+        }
+
+        // Use sentTimestamp to calculate search range
+const startDate = new Date(td.sentTimestamp);
+startDate.setDate(startDate.getDate() - 1); 
+const endDate = new Date(td.sentTimestamp);
+endDate.setDate(endDate.getDate() + 1); 
+
+        try {
+          const response = await fetch("https://api.smtp2go.com/v3/activity/search", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Smtp2go-Api-Key": smtpKey
+            },
+            body: JSON.stringify({
+              search_recipient: recipientEmail,
+              start_date: startDate.toISOString().split("T")[0],
+              end_date: endDate.toISOString().split("T")[0],
+              event_types: ["processed","delivered","opened","clicked","soft-bounced","hard-bounced","rejected","spam","unsubscribed"],
+              limit: 100
+            })
+          });
+         console.log("response", response)
+          if (!response.ok) {
+            const errText = await response.text();
+            results.push({ recipientEmail, emailId, status: "API Error", error: errText, events: [] });
+            continue;
+          }
+
+          const data = await response.json();
+
+          const allEvents = data.data?.events || [];
+          console.log(`All events for ${recipientEmail}:`, allEvents);
+
+// ✅ Match all events for recipient email first
+let relevantEvents = [];
+          // Optional: Highlight specific email_id if needed
+if (emailId) {
+relevantEvents = allEvents.filter(e => e.email_id === emailId);
+    
+console.log("Inside EmailId relevantEvents", relevantEvents)
+}
+// 2️⃣ If no exact match, fallback to recipient email
+if (relevantEvents.length === 0) {
+  relevantEvents = allEvents.filter(
+    e => e.recipient?.toLowerCase() === recipientEmail.toLowerCase()
+  );
+}
+
+// 3️⃣ Sort chronologically to build the journey
+relevantEvents.sort((a, b) => new Date(a.date) - new Date(b.date));
+        const status = relevantEvents.length > 0 ? determineStatus(relevantEvents) : "Sent";
+         console.log("status", status)
+          results.push({ recipientEmail, emailId, status, events: relevantEvents });
+
+        } catch (err) {
+          results.push({ recipientEmail, emailId, status: "Error", error: err.message, events: [] });
+        }
+
+        // Avoid SMTP2GO rate limits
+        await new Promise(resolve => setTimeout(resolve, 1100));
+      }
+
+      return res.status(200).json({ success: true, results, timestamp: new Date().toISOString() });
+
+    } catch (err) {
+      logger.error("Email tracking error", { clientIP, error: err.message });
+      return res.status(500).json({ error: "Failed to get email tracking status", details: err.message });
+    }
+  }
+);
+
+
+// Helper function to determine status from events
+function determineStatus(events) {
+  if (events.some(e => e.event === 'hard-bounced')) return 'Hard Bounced';
+  if (events.some(e => e.event === 'spam')) return 'Marked as Spam';
+  if (events.some(e => e.event === 'rejected')) return 'Rejected';
+  if (events.some(e => e.event === 'soft-bounced')) return 'Soft Bounced';
+  if (events.some(e => e.event === 'unsubscribed')) return 'Unsubscribed';
+  if (events.some(e => e.event === 'clicked')) return 'Clicked';
+  if (events.some(e => e.event === 'opened')) return 'Opened';
+  if (events.some(e => e.event === 'delivered')) return 'Delivered';
+  if (events.some(e => e.event === 'processed')) return 'Processed';
+  return 'Sent';
+}
+
+
+// Define HeyGen secret
+const HEYGEN_KEY = defineSecret("HEYGEN_KEY");
+
+
+export const generateHeyGen = onRequest(
+  { maxInstances: 20, secrets: [HEYGEN_KEY] },
+  async (req, res) => {
+        // --- CORS ---
+    const origin = req.headers.origin;
+    const allowedOriginsStr = process.env.ALLOWED_ORIGINS || 
+      "http://localhost:3000, http://localhost:3001, https://neorecruit.web.app, https://neorecruit-admin.web.app, https://neorecruit-admin-stage.web.app, https://neorecruit-stage.web.app, https://neorecruit-admin-stage2.web.app, https://neorecruit-stage2.web.app,  https://neorecruit-hr-admin.web.app, https://neorecruit-admin-test.web.app, https://neorecruit-pentesting-admin.web.app, https://neorecruit-pentesting.web.app, https://neorecruit-talent.web.app, https://neorecruit-build3-talent.web.app, https://neodonya-hr.web.app, https://neodonya-hr-react.web.app, https://neodonya-hr-stage.web.app,https://neodonya-hr-stage2.web.app,https://neodonya-recruit.web.app, https://neodonya-recruit-stage.web.app, https://neodonya-recruit-stage2.web.app, https://neo-test1.web.app,https://neo-test-hr.web.app, https://neo-test-candidate.web.app,  https://candidate-neorecruit.web.app"
+    
+    const allowedOrigins = allowedOriginsStr.split(",").map(s => s.trim()).filter(Boolean);
+    
+    // Explicitly check if origin is allowed
+    if (origin && allowedOrigins.includes(origin)) {
+      res.set("Access-Control-Allow-Origin", origin);
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.set("Access-Control-Allow-Credentials", "true");
+    }
+    
+    // Handle preflight OPTIONS request
+    if (req.method === "OPTIONS") {
+      return res.status(204).send("");
+    }
+      try {
+  const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return sendError(res, origin, 401, "Authentication required");
+      }
+
+      let userId;
+      try {
+        const idToken = authHeader.split("Bearer ")[1];
+        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        userId = decodedToken.uid;
+      } catch (e) {
+        logger.warn("Invalid auth token", e);
+        return sendError(res, origin, 401, "Authentication failed");
+      }
+    // Rate limiting
+    const xff = req.headers['x-forwarded-for'];
+    const clientIP = (xff ? xff.split(',')[0].trim() : req.ip) || 'unknown';
+    const now = Date.now();
+
+    if (!rateLimitMap.has(clientIP)) {
+      rateLimitMap.set(clientIP, []);
+    }
+
+    const attempts = rateLimitMap.get(clientIP);
+    const recentAttempts = attempts.filter(time => now - time < 60 * 1000); // last 1 min
+
+    if (recentAttempts.length >= MAX_ATTEMPTS_PER_MINUTE) {
+      logger.warn('Rate limit exceeded', { clientIP });
+      return res.status(429).json({ error: "Too many requests. Please wait a minute." });
+    }
+
+    recentAttempts.push(now);
+    rateLimitMap.set(clientIP, recentAttempts);
+
+    // Clean up old entries occasionally
+    if (Math.random() < 0.1) {
+      cleanupRateLimit();
+    }
+
+      const heygenKey = HEYGEN_KEY.value();
+      if (!heygenKey) throw new Error("HEYGEN_KEY not defined");
+
+      const response = await fetch("https://api.heygen.com/v1/streaming.create_token", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${heygenKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        logger.error('HeyGen request failed', { clientIP, data });
+        return res.status(response.status).json({ error: "HeyGen request failed", details: data });
+      }
+
+      logger.info('HeyGen request successful', { clientIP});
+        return res.status(200).json({
+        success: true,
+        token: data?.data?.token || null
+      });
+
+    } catch (err) {
+      logger.error("HeyGen error", { clientIP, error: err.message });
+      return res.status(500).json({ error: "HeyGen failed", details: err.message });
+    }
+  }
+);
+
+// Helper: cleanup old rate limit entries
+function cleanupRateLimit() {
+  const now = Date.now();
+  const oneHour = 60 * 60 * 1000;
+
+  for (const [ip, attempts] of rateLimitMap.entries()) {
+    const recent = attempts.filter(time => now - time < oneHour);
+    if (recent.length === 0) {
+      rateLimitMap.delete(ip);
+    } else {
+      rateLimitMap.set(ip, recent);
+    }
+  }
+  logger.info('Rate limit cleanup completed', { activeKeys: rateLimitMap.size });
+}
+
+// Helper to always include CORS headers
+function sendError(res, origin, status, message) {
+  if (allowedOrigins.includes(origin)) {
+    res.set("Access-Control-Allow-Origin", origin);
+    res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  }
+  return res.status(status).json({ error: message });
+}
+
+export const STT_LANGUAGE_LIST = [
+  { label: 'Arabic', value: 'ar', key: 'ar' },
+  { label: 'Bulgarian', value: 'bg', key: 'bg' },
+  { label: 'Chinese', value: 'zh', key: 'zh' },
+  { label: 'Czech', value: 'cs', key: 'cs' },
+  { label: 'Danish', value: 'da', key: 'da' },
+  { label: 'Dutch', value: 'nl', key: 'nl' },
+  { label: 'English', value: 'en', key: 'en' },
+  { label: 'Finnish', value: 'fi', key: 'fi' },
+  { label: 'French', value: 'fr', key: 'fr' },
+  { label: 'German', value: 'de', key: 'de' },
+  { label: 'Greek', value: 'el', key: 'el' },
+  { label: 'Hindi', value: 'hi', key: 'hi' },
+  { label: 'Hungarian', value: 'hu', key: 'hu' },
+  { label: 'Indonesian', value: 'id', key: 'id' },
+  { label: 'Italian', value: 'it', key: 'it' },
+   { label: 'Japanese', value: 'ja', key: 'ja' },
+  { label: 'Korean', value: 'ko', key: 'ko' },
+  { label: 'Malay', value: 'ms', key: 'ms' },
+  { label: 'Norwegian', value: 'no', key: 'no' },
+  { label: 'Polish', value: 'pl', key: 'pl' },
+  { label: 'Portuguese', value: 'pt', key: 'pt' },
+  { label: 'Romanian', value: 'ro', key: 'ro' },
+  { label: 'Russian', value: 'ru', key: 'ru' },
+  { label: 'Tamil', value: 'ta', key: 'ta' },
+  { label: 'Telugu', value: 'te', key: 'te' },
+  { label: 'Slovak', value: 'sk', key: 'sk' },
+  { label: 'Spanish', value: 'es', key: 'es' },
+  { label: 'Swedish', value: 'sv', key: 'sv' },
+  { label: 'Turkish', value: 'tr', key: 'tr' },
+  { label: 'Ukrainian', value: 'uk', key: 'uk' },
+  { label: 'Vietnamese', value: 'vi', key: 'vi' },
+];
+
+function mapLanguageToCode(userLang) {
+  if (!userLang) return "en"; // fallback
+  const match = STT_LANGUAGE_LIST.find(
+    (l) =>
+      l.label.toLowerCase() === userLang.toLowerCase() ||
+      l.key.toLowerCase() === userLang.toLowerCase() ||
+      l.value.toLowerCase() === userLang.toLowerCase()
+  );
+  return match?.value?.toLowerCase() || "en";
+}
+
+function getLocalAlert(detected, target) {
+  detected = (detected || "").toLowerCase();
+  target = (target || "").toLowerCase();
+
+  // Find labels from STT_LANGUAGE_LIST for user-friendly names
+  const getLabel = (code) => {
+    const lang = STT_LANGUAGE_LIST.find(l => l.value.toLowerCase() === code);
+    return lang ? lang.label : code.toUpperCase();
+  };
+
+  const expectedLabel = getLabel(target);
+  const spokenLabel = getLabel(detected);
+
+  // If Whisper didn't return a language but transcript exists
+  if (!detected || detected === "und") {
+    return `Please answer in ${expectedLabel}.`;
+  }
+
+  // If language mismatch
+  return `Please answer in ${expectedLabel}.`;
+}
+
+
+// Secrets
+const OPENAI_KEY = defineSecret("openai-api-key");
+
+function getModelForRequest(mode, extraParams = {}) {
+  // Deep reasoning / evaluation / structured output
+  if (
+    extraParams?.functions ||
+    extraParams?.function_call ||
+    extraParams?.response_format
+  ) {
+    return "gpt-5.2";
+  }
+
+  // Normal conversation
+  if (mode === "chat") {
+    return "gpt-5.2-chat-latest";
+  }
+
+  return "gpt-5.2-chat-latest";
+}
+export const runOpenAITest = onRequest(
+  { secrets: [OPENAI_KEY], maxInstances: 20 },
+  async (req, res) => {
+
+    // --- CORS ---
+    const origin = req.headers.origin;
+    const allowedOriginsStr = process.env.ALLOWED_ORIGINS ||
+      "http://localhost:3000, http://localhost:3001, https://neorecruit.web.app, https://neorecruit-admin.web.app, https://neorecruit-admin-stage.web.app, https://neorecruit-stage.web.app, https://neorecruit-admin-stage2.web.app, https://neorecruit-stage2.web.app, https://neorecruit-hr-admin.web.app, https://neorecruit-admin-test.web.app, https://neorecruit-pentesting-admin.web.app, https://neorecruit-pentesting.web.app, https://neorecruit-talent.web.app, https://neorecruit-build3-talent.web.app, https://neodonya-hr.web.app, https://neodonya-hr-react.web.app, https://neodonya-hr-stage.web.app, https://neodonya-hr-stage2.web.app, https://neodonya-recruit.web.app, https://neodonya-recruit-stage.web.app, https://neodonya-recruit-stage2.web.app, https://neo-test1.web.app, https://neo-test-hr.web.app, https://neo-test-candidate.web.app, https://candidate-neorecruit.web.app";
+
+    const allowedOrigins = allowedOriginsStr.split(",").map(s => s.trim());
+    if (origin && allowedOrigins.includes(origin)) {
+      res.set("Access-Control-Allow-Origin", origin);
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.set("Access-Control-Allow-Credentials", "true");
+    }
+
+    if (req.method === "OPTIONS") return res.status(204).send("");
+
+    try {
+      // ---- AUTH ----
+      const authHeader = req.headers.authorization;
+      if (!authHeader?.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "Authentication required" });
+      }
+
+      let userId;
+      try {
+        const idToken = authHeader.split("Bearer ")[1];
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        userId = decoded.uid;
+      } catch {
+        return res.status(401).json({ error: "Authentication failed" });
+      }
+
+      // ---- REQUEST DATA ----
+      const { messages, mode, audio, extraParams } = req.body?.data || {};
+      const apiKey = OPENAI_KEY.value();
+      if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY not found" });
+
+      const voice = extraParams?.voice || "echo";
+
+      // =================================================================
+      //                         TTS MODE
+      // =================================================================
+      if (mode === "tts") {
+        const r = await fetch("https://api.openai.com/v1/audio/speech", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-4o-mini-tts",
+            voice,
+            input: messages.map(m => m.content).join(" ")
+          }),
+        });
+
+        if (!r.ok) {
+          const errorText = await r.text();
+          return res.status(500).json({ error: `TTS failed: ${errorText}` });
+        }
+
+        const buffer = await r.arrayBuffer();
+        return res.status(200).json({
+          result: { data: { audio: Buffer.from(buffer).toString("base64") } },
+        });
+      }
+
+// =================================================================
+//                     TRANSCRIBE MODE  (MIC)
+// =================================================================
+if (mode === "transcribe") {
+  if (!audio) return res.status(400).json({ error: "Audio required" });
+
+  try {
+    const { default: FormDataModule } = await import("form-data");
+    const FormData = FormDataModule;
+    const formData = new FormData();
+
+    // Convert base64 → buffer
+    if (typeof audio === "string") {
+      const base64 = audio.includes("base64,")
+        ? audio.split("base64,")[1]
+        : audio;
+      formData.append("file", Buffer.from(base64, "base64"), {
+        filename: "audio.wav",
+        contentType: "audio/wav",
+      });
+    } else {
+      formData.append("file", audio);
+    }
+
+    formData.append("model", "whisper-1");
+    formData.append("response_format", "verbose_json");
+    formData.append("translate", "false");
+    formData.append("temperature", "0");
+
+    const stt = await fetch(
+      "https://api.openai.com/v1/audio/transcriptions",
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}` },
+        body: formData,
+      }
+    );
+
+    if (!stt.ok) {
+      const errorText = await stt.text();
+      return res
+        .status(500)
+        .json({ error: `Transcription failed: ${errorText}` });
+    }
+
+    const data = await stt.json();
+
+    // Build text from segments (preferred)
+    const originalText = data.segments
+      ? data.segments.map(s => s?.text || "").join(" ").trim()
+      : (data.text || "").trim();
+
+    const target = mapLanguageToCode(extraParams?.userLanguage || "en");
+
+    logger.info("📝 Whisper Result", {
+      detectedByWhisper: data.language,
+      preview: originalText.slice(0, 200),
+      segments: data.segments?.length || 0,
+    });
+
+    // ===============================================================
+    // STEP 0 — ONLY BLOCK REAL SILENCE / MIC TAP
+    // ===============================================================
+    const segmentsCount = Array.isArray(data.segments)
+      ? data.segments.length
+      : 0;
+
+    if (segmentsCount === 0 || !originalText) {
+      return res.status(200).json({
+        result: {
+          data: {
+            text: "",
+            valid: false,
+            silent: true,
+            detectedLanguage: "unknown",
+          },
+        },
+      });
+    }
+
+    // ===============================================================
+    // STEP 1 — Normalize Whisper language
+    // ===============================================================
+    const normalize = (lang) => {
+      if (!lang) return "";
+      const l = lang.toLowerCase();
+      if (["en", "eng", "english"].includes(l)) return "en";
+      if (["ja", "jpn", "japanese"].includes(l)) return "ja";
+      if (["ar", "ara", "arabic"].includes(l)) return "ar";
+      return l;
+    };
+
+    let detected = "";
+
+    if (data.language_probs && Object.keys(data.language_probs).length) {
+      detected = Object.entries(data.language_probs)
+        .sort((a, b) => b[1] - a[1])[0]?.[0];
+      detected = normalize(detected);
+    } else {
+      detected = normalize(data.language);
+    }
+
+    // ===============================================================
+    // STEP 2 — Script-based fallback if Whisper unsure
+    // ===============================================================
+    if (!detected || detected === "und") {
+      if (/[A-Za-z]/.test(originalText)) detected = "en";
+      else if (/[\u0600-\u06FF]/.test(originalText)) detected = "ar";
+      else if (/[\u3040-\u30FF\u31F0-\u31FF]/.test(originalText)) detected = "ja";
+      else detected = target;
+    }
+
+    // ===============================================================
+    // STEP 3 — English interview: ALWAYS accept English text
+    // (single word, fillers, sentences — all allowed)
+    // ===============================================================
+    if (target === "en" && /[A-Za-z]/.test(originalText)) {
+      detected = "en";
+    }
+
+    // ===============================================================
+    // STEP 4 — Wrong language → show warning (no blocking)
+    // ===============================================================
+    if (detected !== target) {
+      return res.status(200).json({
+        result: {
+          data: {
+            text: originalText,
+            valid: false,
+            warning: getLocalAlert(detected, target),
+            detectedLanguage: detected,
+            messageId: Date.now(),
+          },
+        },
+      });
+    }
+
+    // ===============================================================
+    // SUCCESS — PASS EVERYTHING VALID TO GPT
+    // ===============================================================
+    return res.status(200).json({
+      result: {
+        data: {
+          text: originalText,
+          valid: true,
+          detectedLanguage: detected,
+          messageId: Date.now(),
+        },
+      },
+    });
+  } catch (err) {
+    return res
+      .status(500)
+      .json({ error: `Transcription failed: ${err.message}` });
+  }
+}
+
+
+
+      // 🚨⛔ IMPORTANT — IF TRANSCRIBE WAS HIT, WE EXIT ALREADY
+      // OTHERWISE CHAT WILL RUN & CRASH
+      if (mode === "transcribe") return;
+
+
+// =================================================================
+//                  VALIDATE TYPED TEXT MODE
+// =================================================================
+if (mode === "validateText") {
+  const { text, extraParams } = req.body?.data || {};
+  const target = mapLanguageToCode(extraParams?.userLanguage || "en");
+
+  // 1️⃣ Empty / too short → invalid
+  if (!text || text.trim().length < 1) {
+    return res.status(200).json({
+      result: {
+        data: {
+          valid: false,
+          warning: `Please answer in ${extraParams?.userLanguage || "English"}.`,
+          detectedLanguage: "unknown",
+          messageId: Date.now()
+        }
+      }
+    });
+  }
+
+  const t = text.trim();
+
+
+
+// 2️⃣ Detect LANGUAGE using scripts + roman patterns
+function detectFromText(str, target) {
+  const s = str.toLowerCase().trim();
+      const hasLatin = /[a-z]/i.test(s);
+    const wordCount = s.split(/\s+/).filter(Boolean).length;
+
+       logger.info("LANGUAGE DETECTION START", {
+      target,
+      sample: s.slice(0, 80),
+      wordCount,
+      hasLatin
+    });
+
+  // ---------- Script-based (Unicode blocks) ----------
+  if (/[\u0C00-\u0C7F]/.test(s)) return "te";   // Telugu
+  if (/[\u0900-\u097F]/.test(s)) return "hi";   // Hindi/Devanagari
+  if (/[\u0B80-\u0BFF]/.test(s)) return "ta";   // Tamil
+  if (/[\u0D00-\u0D7F]/.test(s)) return "ml";   // Malayalam
+  if (/[\u0C80-\u0CFF]/.test(s)) return "kn";   // Kannada
+  if (/[\u0980-\u09FF]/.test(s)) return "bn";   // Bengali
+  if (/[\u0600-\u06FF]/.test(s)) return "ar";   // Arabic script
+  if (/[\u3040-\u30FF\u4E00-\u9FFF]/.test(s)) return "ja"; // Japanese script
+
+  // ============================================================
+  // 2️⃣ Romanized language rules
+  // ============================================================
+
+    function hit(regex) {
+      return (s.match(regex) || []).length;
+    }
+        const romanRules = {
+      ja: /\b(watashi|anata|kore|sore|desu|masu|arigatou|ohayou|sumimasen|onegaishimasu|douzo|genki|doumo|suki|kirai|nihon|nihongo|sensei|tokoro|youna|yōna|baai|junno|smuuzu|omoshiroi|arimasu|ikimasu)\b/gi,
+      ar: /\b(assalamu|assalam|alsalam|salam|salaam|as-salamu|as-salam|alaikum|alaikom|alaykum|marhaba|marhabaan|marhaba|ahlan|ahlanwasahlan|ahlan-wa-sahlan|sahlan|sahlon|ismi|ismee|shukran|shokran|shukraan|afwan|habibi|habibti|habebti|wallah|walla|allah|allahuma|inshaallah|inshallah|inshAllah|insha-Allah|inshaalla|kaifa|kayfa|keif|keifak|keifik|haluk|halik|halak|sabah|saba|sabahulkhair|sabah-khair|sabahalkhair|masa|masaa|masaaulkhair|masaalkhair|mumkin|momkin|shwaya|shwia|taaban|mafish|mafeesh|mafish|bahibak|bahibik\ behib)\b/gi,
+      te: /\b(naa|nenu|peru|meeru|meeku|mee|naaku|naadi|vadi|vallu|inka|ippudu|cheppu|cheppandi|cheyandi|vaddu|ledu|unnanu|unnadi|bagunnanu|bagunnadi|evaru|emi|emiti|entha|enduku|ekkada|manchi|chala|tappu|sare|aithe)\b/gi,
+      hi: /\b(namaste|namaskar|mujhe|kyun|kaun|kahan|kidhar|batao|samjho|dekho|sunna|bolna|paisa|khana|pani|pyar|dost|bhai|behen)\b/gi,
+      ta: /\b(vanakkam|naan|enna|enaku|ungal|irukiren|iruken|irukka|solren|sollunga|epdi|eppadi|seriya|seri|appadi|romba|nalla|nanri|sapdre|sapdringa|sapten)\b/gi,
+      kn: /\b(nanna|hesaru|yenu|yaake|yelli|hegide|chennagide|illa|haudu|nimage|neenu|swalpa|sari|eshtu|yavaga|yakke|madthiya|madbedi)\b/gi,
+      ml: /\b(njan|ente|enniku|peru|allallo|allatha|anu|alle|ningal|aval|avan|nalla|vallare|poli)\b/gi,
+      bn: /\b(ami|aami|tumi|apni|bhalo|valo|kemon|kamon|achho|acho|achi|ache|ki|kotha|kothay|keno|amader|tomar|amar|bhai|bon)\b/gi
+    };
+
+  if (hasLatin) {
+    for (const [lang, regex] of Object.entries(romanRules)) {
+      const hits = hit(regex);
+
+      const isStrongRoman =
+        (hits >= 2 && wordCount >= 2) || // short but clear
+        (hits >= 1 && wordCount >= 4);   // longer sentence
+
+      if (isStrongRoman) {
+        logger.info("LANGUAGE DETECTED", {
+          detected: lang,
+          reason: "Romanized non-English (guarded)",
+          hits,
+          wordCount
+        });
+        return lang;
+      }
+    }
+  }
+
+      // -----------------------------------------------------------
+    // ✅ 2.3 SHORT ENGLISH ANSWERS (CRITICAL FIX)
+    // -----------------------------------------------------------
+    if (hasLatin && wordCount <= 5) {
+      logger.info("LANGUAGE DETECTED", {
+        detected: "en",
+        reason: "Short English answer",
+        wordCount
+      });
+      return "en";
+    }
+
+    /* ============================================================
+       4️⃣ STRICT ENGLISH INTERVIEW CHECK
+    ============================================================ */
+  const englishIndicators =
+    /\b(the|and|for|with|have|from|that|this|will|your|what|about|which|when|make|just|know|their|would|there|been|more|other|could|should)\b/i;
+
+  if (hasLatin && (englishIndicators.test(s) || wordCount >= 6)) {
+    logger.info("LANGUAGE DETECTED", {
+      detected: "en",
+      reason: englishIndicators.test(s)
+        ? "English indicator words"
+        : "Long English sentence",
+      wordCount
+    });
+    return "en";
+  }
+    /* ============================================================
+       FINAL FALLBACK
+    ============================================================ */
+  logger.info("LANGUAGE FALLBACK", {
+    detected: "unknown",
+    wordCount
+  });
+
+  return "unknown";
+  
+  
+}
+
+
+  const detected = detectFromText(t, target);
+
+  
+
+  // 3️⃣ Mismatch → send warning
+  if (detected !== target) {
+        logger.info("LANGUAGE MISMATCH", {
+      detected,
+      expected: target,
+      inputPreview: t.slice(0, 80)
+    });
+    return res.status(200).json({
+      result: {
+        data: {
+          valid: false,
+          warning: getLocalAlert(detected, target),
+          detectedLanguage: detected,
+           messageId: Date.now()
+        }
+      }
+    });
+  }
+
+  // 4️⃣ Success
+    logger.info("LANGUAGE MATCH SUCCESS", {
+    target,
+    detected
+  });
+  return res.status(200).json({
+    result: {
+      data: {
+        valid: true,
+        detectedLanguage: target,
+         messageId: Date.now()
+      }
+    }
+  });
+}
+
+
+      // =================================================================
+      //                     CHAT COMPLETION (GPT)
+      // =================================================================
+      if (!messages?.length) {
+        return res.status(400).json({ error: "messages[] required" });
+      }
+
+      // =================================================================
+
+      const model = getModelForRequest(mode, extraParams);
+      logger.info("🧠 OpenAI Model Selected", {
+  mode,
+  hasFunctions: !!extraParams?.functions,
+  hasFunctionCall: !!extraParams?.function_call,
+  hasResponseFormat: !!extraParams?.response_format,
+  selectedModel: model,
+});
+      const chatBody = {
+        model,
+        messages,
+        max_completion_tokens: Math.min(6000, 8000)
+      };
+
+      if (extraParams?.userLanguage) {
+        chatBody.messages.unshift({
+          role: "system",
+          content: `You must reply ONLY in ${extraParams.userLanguage}. 
+Always greet and answer in ${extraParams.userLanguage}. 
+Never use English unless ${extraParams.userLanguage} is English.`
+        });
+      }
+
+if (extraParams) {
+  if (extraParams.response_format) chatBody.response_format = extraParams.response_format;
+  if (extraParams.functions) chatBody.functions = extraParams.functions;
+  if (extraParams.function_call) chatBody.function_call = extraParams.function_call;
+
+  // 🚨 temperature NOT allowed for gpt-5.2
+  if (
+    extraParams.temperature &&
+    !model.startsWith("gpt-5.2")
+  ) {
+    chatBody.temperature = extraParams.temperature;
+  }
+}
+
+      // 🚨 AUTO-FIX for LLM-usage check (IMPORTANT)
+// If a function_call is expected but frontend did not add response_format,
+// force JSON output so OpenAI cannot reply in paragraphs.
+if (extraParams?.function_call && !extraParams?.response_format) {
+  chatBody.response_format = { type: "json_object" };
+ 
+}
+
+
+
+      const r = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(chatBody),
+      });
+
+      const d = await r.json();
+      if (!r.ok) {
+        return res.status(500).json({ error: d.error?.message || "OpenAI chat error" });
+      }
+
+      const msg = d.choices?.[0]?.message || {};
+      const reply = msg.content || msg.function_call?.arguments || "";
+
+      return res.status(200).json({
+        result: { data: { reply, raw: d } },
+      });
+
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+export const runOpenAI = onRequest(
+  { secrets: [OPENAI_KEY], maxInstances: 20 },
+  async (req, res) => {
+
+    // --- CORS ---
+    const origin = req.headers.origin;
+    const allowedOriginsStr = process.env.ALLOWED_ORIGINS ||
+      "http://localhost:3000, http://localhost:3001, https://neorecruit.web.app, https://neorecruit-admin.web.app, https://neorecruit-admin-stage.web.app, https://neorecruit-stage.web.app, https://neorecruit-admin-stage2.web.app, https://neorecruit-stage2.web.app, https://neorecruit-hr-admin.web.app, https://neorecruit-admin-test.web.app, https://neorecruit-pentesting-admin.web.app, https://neorecruit-pentesting.web.app, https://neorecruit-talent.web.app, https://neorecruit-build3-talent.web.app, https://neodonya-hr.web.app, https://neodonya-hr-react.web.app, https://neodonya-hr-stage.web.app, https://neodonya-hr-stage2.web.app, https://neodonya-recruit.web.app, https://neodonya-recruit-stage.web.app, https://neodonya-recruit-stage2.web.app, https://neo-test1.web.app, https://neo-test-hr.web.app, https://neo-test-candidate.web.app, https://candidate-neorecruit.web.app";
+
+    const allowedOrigins = allowedOriginsStr.split(",").map(s => s.trim());
+    if (origin && allowedOrigins.includes(origin)) {
+      res.set("Access-Control-Allow-Origin", origin);
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.set("Access-Control-Allow-Credentials", "true");
+    }
+
+    if (req.method === "OPTIONS") return res.status(204).send("");
+
+    try {
+      // ---- AUTH ----
+      const authHeader = req.headers.authorization;
+      if (!authHeader?.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "Authentication required" });
+      }
+
+      let userId;
+      try {
+        const idToken = authHeader.split("Bearer ")[1];
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        userId = decoded.uid;
+      } catch {
+        return res.status(401).json({ error: "Authentication failed" });
+      }
+
+      // ---- REQUEST DATA ----
+      const { messages, mode, audio, extraParams } = req.body?.data || {};
+      const apiKey = OPENAI_KEY.value();
+      if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY not found" });
+
+      const voice = extraParams?.voice || "echo";
+
+      // =================================================================
+      //                         TTS MODE
+      // =================================================================
+      if (mode === "tts") {
+        const r = await fetch("https://api.openai.com/v1/audio/speech", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-4o-mini-tts",
+            voice,
+            input: messages.map(m => m.content).join(" ")
+          }),
+        });
+
+        if (!r.ok) {
+          const errorText = await r.text();
+          return res.status(500).json({ error: `TTS failed: ${errorText}` });
+        }
+
+        const buffer = await r.arrayBuffer();
+        return res.status(200).json({
+          result: { data: { audio: Buffer.from(buffer).toString("base64") } },
+        });
+      }
+
+// =================================================================
+//                     TRANSCRIBE MODE  (MIC)
+// =================================================================
+if (mode === "transcribe") {
+  if (!audio) return res.status(400).json({ error: "Audio required" });
+
+  try {
+    const { default: FormDataModule } = await import("form-data");
+    const FormData = FormDataModule;
+    const formData = new FormData();
+
+    // Convert base64 → buffer
+    if (typeof audio === "string") {
+      const base64 = audio.includes("base64,")
+        ? audio.split("base64,")[1]
+        : audio;
+      formData.append("file", Buffer.from(base64, "base64"), {
+        filename: "audio.wav",
+        contentType: "audio/wav",
+      });
+    } else {
+      formData.append("file", audio);
+    }
+
+    formData.append("model", "whisper-1");
+    formData.append("response_format", "verbose_json");
+    formData.append("translate", "false");
+    formData.append("temperature", "0");
+
+    const stt = await fetch(
+      "https://api.openai.com/v1/audio/transcriptions",
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}` },
+        body: formData,
+      }
+    );
+
+    if (!stt.ok) {
+      const errorText = await stt.text();
+      return res
+        .status(500)
+        .json({ error: `Transcription failed: ${errorText}` });
+    }
+
+    const data = await stt.json();
+
+    // Build text from segments (preferred)
+    const originalText = data.segments
+      ? data.segments.map(s => s?.text || "").join(" ").trim()
+      : (data.text || "").trim();
+
+    const target = mapLanguageToCode(extraParams?.userLanguage || "en");
+
+    logger.info("📝 Whisper Result", {
+      detectedByWhisper: data.language,
+      preview: originalText.slice(0, 200),
+      segments: data.segments?.length || 0,
+    });
+
+    // ===============================================================
+    // STEP 0 — ONLY BLOCK REAL SILENCE / MIC TAP
+    // ===============================================================
+    const segmentsCount = Array.isArray(data.segments)
+      ? data.segments.length
+      : 0;
+
+    if (segmentsCount === 0 || !originalText) {
+      return res.status(200).json({
+        result: {
+          data: {
+            text: "",
+            valid: false,
+            silent: true,
+            detectedLanguage: "unknown",
+          },
+        },
+      });
+    }
+
+    // ===============================================================
+    // STEP 1 — Normalize Whisper language
+    // ===============================================================
+    const normalize = (lang) => {
+      if (!lang) return "";
+      const l = lang.toLowerCase();
+      if (["en", "eng", "english"].includes(l)) return "en";
+      if (["ja", "jpn", "japanese"].includes(l)) return "ja";
+      if (["ar", "ara", "arabic"].includes(l)) return "ar";
+      return l;
+    };
+
+    let detected = "";
+
+    if (data.language_probs && Object.keys(data.language_probs).length) {
+      detected = Object.entries(data.language_probs)
+        .sort((a, b) => b[1] - a[1])[0]?.[0];
+      detected = normalize(detected);
+    } else {
+      detected = normalize(data.language);
+    }
+
+    // ===============================================================
+    // STEP 2 — Script-based fallback if Whisper unsure
+    // ===============================================================
+    if (!detected || detected === "und") {
+      if (/[A-Za-z]/.test(originalText)) detected = "en";
+      else if (/[\u0600-\u06FF]/.test(originalText)) detected = "ar";
+      else if (/[\u3040-\u30FF\u31F0-\u31FF]/.test(originalText)) detected = "ja";
+      else detected = target;
+    }
+
+    // ===============================================================
+    // STEP 3 — English interview: ALWAYS accept English text
+    // (single word, fillers, sentences — all allowed)
+    // ===============================================================
+    if (target === "en" && /[A-Za-z]/.test(originalText)) {
+      detected = "en";
+    }
+
+    // ===============================================================
+    // STEP 4 — Wrong language → show warning (no blocking)
+    // ===============================================================
+    if (detected !== target) {
+      return res.status(200).json({
+        result: {
+          data: {
+            text: originalText,
+            valid: false,
+            warning: getLocalAlert(detected, target),
+            detectedLanguage: detected,
+            messageId: Date.now(),
+          },
+        },
+      });
+    }
+
+    // ===============================================================
+    // SUCCESS — PASS EVERYTHING VALID TO GPT
+    // ===============================================================
+    return res.status(200).json({
+      result: {
+        data: {
+          text: originalText,
+          valid: true,
+          detectedLanguage: detected,
+          messageId: Date.now(),
+        },
+      },
+    });
+  } catch (err) {
+    return res
+      .status(500)
+      .json({ error: `Transcription failed: ${err.message}` });
+  }
+}
+
+      // 🚨⛔ IMPORTANT — IF TRANSCRIBE WAS HIT, WE EXIT ALREADY
+      // OTHERWISE CHAT WILL RUN & CRASH
+      if (mode === "transcribe") return;
+
+
+// =================================================================
+//                  VALIDATE TYPED TEXT MODE
+// =================================================================
+if (mode === "validateText") {
+  const { text, extraParams } = req.body?.data || {};
+  const target = mapLanguageToCode(extraParams?.userLanguage || "en");
+
+  // 1️⃣ Empty / too short → invalid
+  if (!text || text.trim().length < 1) {
+    return res.status(200).json({
+      result: {
+        data: {
+          valid: false,
+          warning: `Please answer in ${extraParams?.userLanguage || "English"}.`,
+          detectedLanguage: "unknown",
+          messageId: Date.now()
+        }
+      }
+    });
+  }
+
+  const t = text.trim();
+
+
+
+// 2️⃣ Detect LANGUAGE using scripts + roman patterns
+function detectFromText(str, target) {
+  const s = str.toLowerCase().trim();
+      const hasLatin = /[a-z]/i.test(s);
+    const wordCount = s.split(/\s+/).filter(Boolean).length;
+
+       logger.info("LANGUAGE DETECTION START", {
+      target,
+      sample: s.slice(0, 80),
+      wordCount,
+      hasLatin
+    });
+
+  // ---------- Script-based (Unicode blocks) ----------
+  if (/[\u0C00-\u0C7F]/.test(s)) return "te";   // Telugu
+  if (/[\u0900-\u097F]/.test(s)) return "hi";   // Hindi/Devanagari
+  if (/[\u0B80-\u0BFF]/.test(s)) return "ta";   // Tamil
+  if (/[\u0D00-\u0D7F]/.test(s)) return "ml";   // Malayalam
+  if (/[\u0C80-\u0CFF]/.test(s)) return "kn";   // Kannada
+  if (/[\u0980-\u09FF]/.test(s)) return "bn";   // Bengali
+  if (/[\u0600-\u06FF]/.test(s)) return "ar";   // Arabic script
+  if (/[\u3040-\u30FF\u4E00-\u9FFF]/.test(s)) return "ja"; // Japanese script
+
+  // ============================================================
+  // 2️⃣ Romanized language rules
+  // ============================================================
+
+    function hit(regex) {
+      return (s.match(regex) || []).length;
+    }
+        const romanRules = {
+      ja: /\b(watashi|anata|kore|sore|desu|masu|arigatou|ohayou|sumimasen|onegaishimasu|douzo|genki|doumo|suki|kirai|nihon|nihongo|sensei|tokoro|youna|yōna|baai|junno|smuuzu|omoshiroi|arimasu|ikimasu)\b/gi,
+      ar: /\b(assalamu|assalam|alsalam|salam|salaam|as-salamu|as-salam|alaikum|alaikom|alaykum|marhaba|marhabaan|marhaba|ahlan|ahlanwasahlan|ahlan-wa-sahlan|sahlan|sahlon|ismi|ismee|shukran|shokran|shukraan|afwan|habibi|habibti|habebti|wallah|walla|allah|allahuma|inshaallah|inshallah|inshAllah|insha-Allah|inshaalla|kaifa|kayfa|keif|keifak|keifik|haluk|halik|halak|sabah|saba|sabahulkhair|sabah-khair|sabahalkhair|masa|masaa|masaaulkhair|masaalkhair|mumkin|momkin|shwaya|shwia|taaban|mafish|mafeesh|mafish|bahibak|bahibik\ behib)\b/gi,
+      te: /\b(naa|nenu|peru|meeru|meeku|mee|naaku|naadi|vadi|vallu|inka|ippudu|cheppu|cheppandi|cheyandi|vaddu|ledu|unnanu|unnadi|bagunnanu|bagunnadi|evaru|emi|emiti|entha|enduku|ekkada|manchi|chala|tappu|sare|aithe)\b/gi,
+      hi: /\b(namaste|namaskar|mujhe|kyun|kaun|kahan|kidhar|batao|samjho|dekho|sunna|bolna|paisa|khana|pani|pyar|dost|bhai|behen)\b/gi,
+      ta: /\b(vanakkam|naan|enna|enaku|ungal|irukiren|iruken|irukka|solren|sollunga|epdi|eppadi|seriya|seri|appadi|romba|nalla|nanri|sapdre|sapdringa|sapten)\b/gi,
+      kn: /\b(nanna|hesaru|yenu|yaake|yelli|hegide|chennagide|illa|haudu|nimage|neenu|swalpa|sari|eshtu|yavaga|yakke|madthiya|madbedi)\b/gi,
+      ml: /\b(njan|ente|enniku|peru|allallo|allatha|anu|alle|ningal|aval|avan|nalla|vallare|poli)\b/gi,
+      bn: /\b(ami|aami|tumi|apni|bhalo|valo|kemon|kamon|achho|acho|achi|ache|ki|kotha|kothay|keno|amader|tomar|amar|bhai|bon)\b/gi
+    };
+
+  if (hasLatin) {
+    for (const [lang, regex] of Object.entries(romanRules)) {
+      const hits = hit(regex);
+
+      const isStrongRoman =
+        (hits >= 2 && wordCount >= 2) || // short but clear
+        (hits >= 1 && wordCount >= 4);   // longer sentence
+
+      if (isStrongRoman) {
+        logger.info("LANGUAGE DETECTED", {
+          detected: lang,
+          reason: "Romanized non-English (guarded)",
+          hits,
+          wordCount
+        });
+        return lang;
+      }
+    }
+  }
+
+      // -----------------------------------------------------------
+    // ✅ 2.3 SHORT ENGLISH ANSWERS (CRITICAL FIX)
+    // -----------------------------------------------------------
+    if (hasLatin && wordCount <= 5) {
+      logger.info("LANGUAGE DETECTED", {
+        detected: "en",
+        reason: "Short English answer",
+        wordCount
+      });
+      return "en";
+    }
+
+    /* ============================================================
+       4️⃣ STRICT ENGLISH INTERVIEW CHECK
+    ============================================================ */
+  const englishIndicators =
+    /\b(the|and|for|with|have|from|that|this|will|your|what|about|which|when|make|just|know|their|would|there|been|more|other|could|should)\b/i;
+
+  if (hasLatin && (englishIndicators.test(s) || wordCount >= 6)) {
+    logger.info("LANGUAGE DETECTED", {
+      detected: "en",
+      reason: englishIndicators.test(s)
+        ? "English indicator words"
+        : "Long English sentence",
+      wordCount
+    });
+    return "en";
+  }
+    /* ============================================================
+       FINAL FALLBACK
+    ============================================================ */
+  logger.info("LANGUAGE FALLBACK", {
+    detected: "unknown",
+    wordCount
+  });
+
+  return "unknown";
+  
+  
+}
+
+
+  const detected = detectFromText(t, target);
+
+  
+
+  // 3️⃣ Mismatch → send warning
+  if (detected !== target) {
+        logger.info("LANGUAGE MISMATCH", {
+      detected,
+      expected: target,
+      inputPreview: t.slice(0, 80)
+    });
+    return res.status(200).json({
+      result: {
+        data: {
+          valid: false,
+          warning: getLocalAlert(detected, target),
+          detectedLanguage: detected,
+           messageId: Date.now()
+        }
+      }
+    });
+  }
+
+  // 4️⃣ Success
+    logger.info("LANGUAGE MATCH SUCCESS", {
+    target,
+    detected
+  });
+  return res.status(200).json({
+    result: {
+      data: {
+        valid: true,
+        detectedLanguage: target,
+         messageId: Date.now()
+      }
+    }
+  });
+}
+
+
+      // =================================================================
+      //                     CHAT COMPLETION (GPT)
+      // =================================================================
+      if (!messages?.length) {
+        return res.status(400).json({ error: "messages[] required" });
+      }
+
+      // =================================================================
+
+
+      const chatBody = {
+        model: "gpt-4o",
+        messages,
+        max_tokens: Math.min(6000, 8000),
+        temperature: 0.7,
+      };
+
+      if (extraParams?.userLanguage) {
+        chatBody.messages.unshift({
+          role: "system",
+          content: `You must reply ONLY in ${extraParams.userLanguage}. 
+Always greet and answer in ${extraParams.userLanguage}. 
+Never use English unless ${extraParams.userLanguage} is English.`
+        });
+      }
+
+      if (extraParams) {
+        if (extraParams.response_format) chatBody.response_format = extraParams.response_format;
+        if (extraParams.functions) chatBody.functions = extraParams.functions;
+        if (extraParams.function_call) chatBody.function_call = extraParams.function_call;
+        if (extraParams.temperature) chatBody.temperature = extraParams.temperature;
+      }
+
+      // 🚨 AUTO-FIX for LLM-usage check (IMPORTANT)
+// If a function_call is expected but frontend did not add response_format,
+// force JSON output so OpenAI cannot reply in paragraphs.
+if (extraParams?.function_call && !extraParams?.response_format) {
+  chatBody.response_format = { type: "json_object" };
+  chatBody.temperature = 0.0; // improves structured JSON reliability
+}
+
+
+
+      const r = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(chatBody),
+      });
+
+      const d = await r.json();
+      if (!r.ok) {
+        return res.status(500).json({ error: d.error?.message || "OpenAI chat error" });
+      }
+
+      const msg = d.choices?.[0]?.message || {};
+      const reply = msg.content || msg.function_call?.arguments || "";
+
+      return res.status(200).json({
+        result: { data: { reply, raw: d } },
+      });
+
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+
+
+
+// Record interview timestamps
+export const recordInterviewTimestamp = onRequest(
+  { maxInstances: 10 },
+  async (req, res) => {
+        // --- CORS ---
+    const origin = req.headers.origin;
+    const allowedOriginsStr = process.env.ALLOWED_ORIGINS || 
+      "http://localhost:3000, http://localhost:3001, https://neorecruit.web.app, https://neorecruit-admin.web.app, https://neorecruit-admin-stage.web.app, https://neorecruit-stage.web.app, https://neorecruit-admin-stage2.web.app, https://neorecruit-stage2.web.app,  https://neorecruit-hr-admin.web.app, https://neorecruit-admin-test.web.app, https://neorecruit-pentesting-admin.web.app, https://neorecruit-pentesting.web.app, https://neorecruit-talent.web.app, https://neorecruit-build3-talent.web.app, https://neodonya-hr.web.app, https://neodonya-hr-react.web.app, https://neodonya-hr-stage.web.app,https://neodonya-hr-stage2.web.app,https://neodonya-recruit.web.app, https://neodonya-recruit-stage.web.app, https://neodonya-recruit-stage2.web.app, https://neo-test1.web.app,https://neo-test-hr.web.app, https://neo-test-candidate.web.app,  https://candidate-neorecruit.web.app"
+    
+    const allowedOrigins = allowedOriginsStr.split(",").map(s => s.trim()).filter(Boolean);
+    
+    if (origin && allowedOrigins.includes(origin)) {
+      res.set("Access-Control-Allow-Origin", origin);
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.set("Access-Control-Allow-Credentials", "true");
+    }
+    
+    // Handle preflight request
+    if (req.method === "OPTIONS") {
+      return res.status(204).send("");
+    }
+    
+    // Verify authentication
+    try {
+ // --- Auth verification ---
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return sendError(res, origin, 401, "Authentication required");
+      }
+
+      const idToken = authHeader.split("Bearer ")[1];
+      let decodedToken;
+      try {
+        decodedToken = await admin.auth().verifyIdToken(idToken);
+      } catch (e) {
+        logger.warn("Invalid auth token", e);
+        return sendError(res, origin, 401, "Authentication failed");
+      }
+
+      const userId = decodedToken.uid;
+      logger.info("Authenticated user", { userId });
+      
+      // Extract request data
+      const { companyName, jobName, candidateEmail, eventType, clientTimestamp, db: databaseId} = req.body?.data || {};
+      
+      // Validate required fields
+      if (!companyName || !jobName || !candidateEmail || !eventType) {
+        return res.status(400).json({ error: "Missing required fields" });
+      }
+      
+        let db;
+      try {
+        db = getFirestoreForDB(databaseId);
+      } catch (err) {
+        logger.warn("Invalid DB requested", { databaseId });
+        return sendError(res, origin, 403, "Invalid database requested");
+      }
+       logger.info(`Database Name: ${databaseId}`);
+       const timeDocRef = db
+        .collection(companyName)
+        .doc("Jobs")
+        .collection(jobName)
+        .doc("Candidates")
+        .collection(candidateEmail)
+        .doc("TIMESTAMP");
+
+      const nowISO = new Date().toISOString();
+      const existingSnap = await timeDocRef.get();
+      const existingDoc = existingSnap.exists ? existingSnap.data() : null;
+
+      const updateData = {
+        updatedAt: nowISO
+      };
+
+      if (eventType === "start") {
+        updateData.InterviewStart = nowISO;
+        updateData.ClientInterviewStart = clientTimestamp;
+        updateData.FirstInteraction = nowISO;
+        updateData.createdAt = nowISO;
+      }
+
+      if (eventType === "interaction") {
+        updateData.LastInteraction = nowISO;
+      }
+
+     if (eventType === "end") {
+  updateData.InterviewEnd = nowISO;
+  updateData.ClientInterviewEnd = clientTimestamp;
+
+  // ✅ Server-trusted duration
+  if (existingDoc?.InterviewStart) {
+    updateData.TotalDuration = Math.floor(
+      (Date.parse(nowISO) - Date.parse(existingDoc.InterviewStart)) / 1000
+    );
+  }
+
+  // 🟡 Client duration (audit only)
+  if (clientTimestamp && existingDoc?.ClientInterviewStart) {
+    updateData.ClientDuration = Math.floor(
+      (clientTimestamp - existingDoc.ClientInterviewStart) / 1000
+    );
+  }
+
+  // 🚨 Tamper detection
+  if (
+    typeof updateData.ClientDuration === "number" &&
+    typeof updateData.TotalDuration === "number"
+  ) {
+    updateData.DurationMismatch =
+      Math.abs(updateData.ClientDuration - updateData.TotalDuration) > 10;
+  }
+}
+
+
+      await timeDocRef.set(updateData, { merge: true });
+
+      return res.status(200).json({ success: true });
+    } catch (error) {
+      console.error("recordTimeInDocument error", error);
+      return res.status(500).json({ error: error.message });
+    }
+  }
+);
+
+// Validate interview timing data
+export const validateInterviewTiming = onRequest(
+   { maxInstances: 10 },
+  async (req, res) => {
+        // --- CORS ---
+    const origin = req.headers.origin;
+    const allowedOriginsStr = process.env.ALLOWED_ORIGINS || 
+      "http://localhost:3000, http://localhost:3001, https://neorecruit.web.app, https://neorecruit-admin.web.app, https://neorecruit-admin-stage.web.app, https://neorecruit-stage.web.app, https://neorecruit-admin-stage2.web.app, https://neorecruit-stage2.web.app,  https://neorecruit-hr-admin.web.app, https://neorecruit-admin-test.web.app, https://neorecruit-pentesting-admin.web.app, https://neorecruit-pentesting.web.app, https://neorecruit-talent.web.app, https://neorecruit-build3-talent.web.app, https://neodonya-hr.web.app, https://neodonya-hr-react.web.app, https://neodonya-hr-stage.web.app,https://neodonya-hr-stage2.web.app,https://neodonya-recruit.web.app, https://neodonya-recruit-stage.web.app, https://neodonya-recruit-stage2.web.app, https://neo-test1.web.app,https://neo-test-hr.web.app, https://neo-test-candidate.web.app,  https://candidate-neorecruit.web.app"
+    
+    const allowedOrigins = allowedOriginsStr.split(",").map(s => s.trim()).filter(Boolean);
+    
+    // Explicitly check if origin is allowed
+    if (origin && allowedOrigins.includes(origin)) {
+      res.set("Access-Control-Allow-Origin", origin);
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.set("Access-Control-Allow-Credentials", "true");
+    }
+    
+    // Handle preflight OPTIONS request
+    if (req.method === "OPTIONS") {
+      return res.status(204).send("");
+    }
+    
+    // Verify authentication
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return sendError(res, origin, 401, "Authentication required");
+      }
+
+      let userId;
+      try {
+        const idToken = authHeader.split("Bearer ")[1];
+        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        userId = decodedToken.uid;
+      } catch (e) {
+        logger.warn("Invalid auth token", e);
+        return sendError(res, origin, 401, "Authentication failed");
+      }
+
+    const { companyName, jobName, candidateEmail, db: databaseId } = req.body?.data || {};
+      console.log(`Processing validation: ${companyName}/${jobName}/${candidateEmail}`);
+    // Validate required fields
+    if (!companyName || !jobName || !candidateEmail) {
+      throw new HttpsError("invalid-argument", "Missing required fields");
+    }
+      let db;
+      try {
+        db = getFirestoreForDB(databaseId);
+      } catch (err) {
+        logger.warn("Invalid DB requested", { databaseId });
+        return sendError(res, origin, 403, "Invalid database requested");
+      }
+       logger.info(`Database Name: ${db}`);
+
+      const timestampRef = db
+        .collection(companyName)
+        .doc("Jobs")
+        .collection(jobName)
+        .doc("Candidates")
+        .collection(candidateEmail)
+        .doc("TIMESTAMP");
+
+      const doc = await timestampRef.get();
+
+      if (!doc.exists) {
+        return res.status(200).json({
+          success: true,
+          validationStatus: "no_records"
+        });
+      }
+
+      const data = doc.data();
+
+      if (!data?.InterviewStart || !data?.InterviewEnd) {
+        return res.status(200).json({
+          success: true,
+          validationStatus: "incomplete"
+        });
+      }
+
+      const start = new Date(data.InterviewStart).getTime();
+      const end = new Date(data.InterviewEnd).getTime();
+      const serverDuration = (end - start) / 1000;
+
+      const clientDuration =
+        data.ClientInterviewEnd && data.ClientInterviewStart
+          ? (data.ClientInterviewEnd - data.ClientInterviewStart) / 1000
+          : null;
+
+      await timestampRef.update({
+        serverDuration,
+        clientDuration,
+        validatedAt: new Date().toISOString()
+      });
+
+      return res.status(200).json({
+        success: true,
+        validationStatus: "valid",
+        serverDuration
+      });
+    } catch (error) {
+      console.error("validateInterviewTiming error", error);
+      return res.status(200).json({
+        success: true,
+        validationStatus: "error",
+        message: error.message
+      });
+    }
+  }
+);
+
+// Add a new function specifically for timestamps
+export const recordTimeInDocument = onRequest(
+  { maxInstances: 10 },
+  async (req, res) => {
+        // --- CORS ---
+    const origin = req.headers.origin;
+    const allowedOriginsStr = process.env.ALLOWED_ORIGINS || 
+      "http://localhost:3000, http://localhost:3001, https://neorecruit.web.app, https://neorecruit-admin.web.app, https://neorecruit-admin-stage.web.app, https://neorecruit-stage.web.app, https://neorecruit-admin-stage2.web.app, https://neorecruit-stage2.web.app,  https://neorecruit-hr-admin.web.app, https://neorecruit-admin-test.web.app, https://neorecruit-pentesting-admin.web.app, https://neorecruit-pentesting.web.app, https://neorecruit-talent.web.app, https://neorecruit-build3-talent.web.app, https://neodonya-hr.web.app, https://neodonya-hr-react.web.app, https://neodonya-hr-stage.web.app,https://neodonya-hr-stage2.web.app,https://neodonya-recruit.web.app, https://neodonya-recruit-stage.web.app, https://neodonya-recruit-stage2.web.app, https://neo-test1.web.app,https://neo-test-hr.web.app, https://neo-test-candidate.web.app,  https://candidate-neorecruit.web.app"
+    
+    const allowedOrigins = allowedOriginsStr.split(",").map(s => s.trim()).filter(Boolean);
+    
+    // Explicitly check if origin is allowed
+    if (origin && allowedOrigins.includes(origin)) {
+      res.set("Access-Control-Allow-Origin", origin);
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.set("Access-Control-Allow-Credentials", "true");
+    }
+    
+    // Handle preflight OPTIONS request
+    if (req.method === "OPTIONS") {
+      return res.status(204).send("");
+    }
+    
+    // Verify authentication
+    try {
+const authHeader = req.headers.authorization;
+if (!authHeader || !authHeader.startsWith("Bearer ")) {
+  return res.status(401).json({ error: "Authentication required" });
+}
+
+const idToken = authHeader.split("Bearer ")[1];
+
+// ✅ THIS LINE WAS MISSING
+const decoded = await admin.auth().verifyIdToken(idToken);
+
+// Now this is valid
+const userId = decoded.uid;
+
+    const { companyName, jobName, candidateEmail, eventType, clientTimestamp, duration, db: databaseId } = req.body?.data || {};
+    
+    if (!companyName || !jobName || !candidateEmail || !eventType) {
+      throw new HttpsError("invalid-argument", "Missing required fields");
+    }
+      let db;
+      try {
+        db = getFirestoreForDB(databaseId);
+      } catch (err) {
+        logger.warn("Invalid DB requested", { databaseId });
+        return sendError(res, origin, 403, "Invalid database requested");
+      }
+       logger.info(`Database Name: ${db}`);
+
+      const timeDocRef = db
+        .collection(companyName)
+        .doc("Jobs")
+        .collection(jobName)
+        .doc("Candidates")
+        .collection(candidateEmail)
+        .doc("TIMESTAMP");
+
+      const nowISO = new Date().toISOString();
+      const updateData = {
+        updatedAt: nowISO
+      };
+
+      if (eventType === "start") {
+        updateData.InterviewStart = nowISO;
+        updateData.ClientInterviewStart = clientTimestamp;
+        updateData.FirstInteraction = nowISO;
+        updateData.createdAt = nowISO;
+      }
+
+      if (eventType === "interaction") {
+        updateData.LastInteraction = nowISO;
+      }
+
+      if (eventType === "end") {
+        updateData.InterviewEnd = nowISO;
+        updateData.ClientInterviewEnd = clientTimestamp;
+      }
+
+      await timeDocRef.set(updateData, { merge: true });
+
+      return res.status(200).json({ success: true });
+    } catch (error) {
+      console.error("recordTimeInDocument error", error);
+      return res.status(500).json({ error: error.message });
+    }
+  }
+);
+
+/**
+ * GetInterviewLanguage - Secure callable function
+ * Fetches InterviewLanguage for a specific company & job.
+ */
+
+export const getInterviewLanguage = onRequest(
+  { maxInstances: 20 },
+  async (req, res) => {
+    // --- CORS handling ---
+    const origin = req.headers.origin;
+    const allowedOriginsStr =
+      process.env.ALLOWED_ORIGINS ||
+      "http://localhost:3000, http://localhost:3001, https://neorecruit.web.app, https://neorecruit-admin.web.app, https://neorecruit-admin-stage.web.app, https://neorecruit-stage.web.app, https://neorecruit-admin-stage2.web.app, https://neorecruit-stage2.web.app,  https://neorecruit-hr-admin.web.app, https://neorecruit-admin-test.web.app, https://neorecruit-pentesting-admin.web.app, https://neorecruit-pentesting.web.app, https://neorecruit-talent.web.app, https://neorecruit-build3-talent.web.app, https://neodonya-hr.web.app, https://neodonya-hr-react.web.app, https://neodonya-hr-stage.web.app,https://neodonya-hr-stage2.web.app,https://neodonya-recruit.web.app, https://neodonya-recruit-stage.web.app, https://neodonya-recruit-stage2.web.app, https://neo-test1.web.app,https://neo-test-hr.web.app, https://neo-test-candidate.web.app,  https://candidate-neorecruit.web.app";
+
+    const allowedOrigins = allowedOriginsStr
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (origin && allowedOrigins.includes(origin)) {
+      res.set("Access-Control-Allow-Origin", origin);
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.set("Access-Control-Allow-Credentials", "true");
+    }
+
+    if (req.method === "OPTIONS") return res.status(204).send("");
+
+    try {
+      // --- Auth verification ---
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return sendError(res, origin, 401, "Authentication required");
+      }
+
+      const idToken = authHeader.split("Bearer ")[1];
+      let decodedToken;
+      try {
+        decodedToken = await admin.auth().verifyIdToken(idToken);
+      } catch (e) {
+        logger.warn("Invalid auth token", e);
+        return sendError(res, origin, 401, "Authentication failed");
+      }
+
+      const userId = decodedToken.uid;
+      logger.info("Authenticated user", { userId });
+
+      // --- Rate limiting ---
+      const xff = req.headers["x-forwarded-for"];
+      const clientIP = (xff ? xff.split(",")[0].trim() : req.ip) || "unknown";
+      const now = Date.now();
+
+      if (!rateLimitMap.has(clientIP)) rateLimitMap.set(clientIP, []);
+      const attempts = rateLimitMap.get(clientIP);
+      const recent = attempts.filter((t) => now - t < 60 * 1000);
+
+      if (recent.length >= MAX_ATTEMPTS_PER_MINUTE) {
+        logger.warn("Rate limit exceeded", { clientIP });
+        return res.status(429).json({
+          success: false,
+          error: "Too many requests. Please wait a minute.",
+        });
+      }
+
+      recent.push(now);
+      rateLimitMap.set(clientIP, recent);
+      if (Math.random() < 0.1) cleanupRateLimit();
+
+      // --- Input validation ---
+      const { companyName, jobId, db: databaseId } = req.body;
+      logger.info(`Using DB: ${databaseId}`);
+      if (!companyName || !jobId)
+        return sendError(res, origin, 400, "Missing companyName or jobId");
+
+            let db;
+      try {
+        db = getFirestoreForDB(databaseId);
+      } catch (err) {
+        logger.warn("Invalid DB requested", { databaseId });
+        return sendError(res, origin, 403, "Invalid database requested");
+      }
+       logger.info(`Database Name: ${db}`);
+      // --- Fetch language from Firestore ---
+      const docRef = db.doc(
+        `${companyName}/Jobs/${jobId}/JD_List`
+      );
+      const docSnap = await docRef.get();
+
+      if (!docSnap.exists) {
+        logger.warn("Job document not found", { companyName, jobId });
+        return res.status(404).json({
+          success: false,
+          error: "Job not found",
+          interviewLanguage: "en",
+        });
+      }
+
+      const jobData = docSnap.data()?.JobData || {};
+      const interviewLang = jobData.InterviewLanguage || "en";
+
+      logger.info("Interview language fetched", {
+        companyName,
+        jobId,
+        interviewLang,
+      });
+
+      return res.status(200).json({
+        success: true,
+        interviewLanguage: interviewLang,
+        source: jobData.InterviewLanguage ? "admin_set" : "default_en",
+      });
+    } catch (error) {
+      logger.error("Error in getInterviewLanguage", error);
+      return res.status(500).json({
+        success: false,
+        error: error.message || "Internal server error",
+      });
+    }
+  }
+);
+
+
+export const e2eCandidateLogin = onRequest(
+  { region: "us-central1" },
+  async (req, res) => {
+
+    // --- CORS ---
+    const origin = req.headers.origin;
+    const allowedOriginsStr =
+      process.env.ALLOWED_ORIGINS ||
+      "http://localhost:3000,http://localhost:3001,https://candidate-neorecruit.web.app";
+
+    const allowedOrigins = allowedOriginsStr
+      .split(",")
+      .map(o => o.trim());
+
+    if (origin && allowedOrigins.includes(origin)) {
+      res.set("Access-Control-Allow-Origin", origin);
+      res.set(
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization, x-e2e-test"
+      );
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Credentials", "true");
+    }
+
+    // ✅ Preflight
+    if (req.method === "OPTIONS") {
+      return res.status(204).send("");
+    }
+
+    // 🔐 Hard E2E guard
+    if (req.headers["x-e2e-test"] !== "true") {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    // 🔑 Create Firebase custom token
+    const customToken = await admin.auth().createCustomToken(
+      "e2e-candidate-uid",
+      {
+        email: "e2e-candidate@neorecruit.com",
+        role: "candidate",
+        e2e: true
+      }
+    );
+
+    return res.status(200).json({ customToken });
+  }
+);

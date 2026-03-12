@@ -1,0 +1,38 @@
+[
+  {
+    "origin": [
+      "http://localhost:3000",
+      "http://localhost:3001",
+      "https://neorecruit.web.app",
+      "https://neorecruit-admin.web.app",
+      "https://neorecruit-admin-stage.web.app",
+      "https://neorecruit-stage.web.app",
+      "https://neorecruit-admin-stage2.web.app",
+      "https://neorecruit-stage2.web.app",
+      "https://neorecruit-hr-admin.web.app",
+      "https://neorecruit-admin-test.web.app",
+      "https://neorecruit-pentesting-admin.web.app",
+      "https://neorecruit-pentesting.web.app",
+      "https://neorecruit-talent.web.app",
+      "https://neorecruit-build3-talent.web.app",
+      "https://neodonya-hr.web.app",
+      "https://neodonya-hr-react.web.app",
+      "https://neodonya-hr-stage.web.app",
+      "https://neodonya-hr-stage2.web.app",
+      "https://neodonya-recruit.web.app",
+      "https://neodonya-recruit-stage.web.app",
+      "https://neodonya-recruit-stage2.web.app",
+      "https://neo-test1.web.app",
+      "https://neo-test-hr.web.app",
+      "https://neo-test-candidate.web.app",
+      "https://candidate-neorecruit.web.app"
+    ],
+    "method": ["GET", "POST", "PUT", "DELETE"],
+    "maxAgeSeconds": 3600,
+    "responseHeader": [
+      "Content-Type",
+      "Authorization",
+      "x-goog-meta-*"
+    ]
+  }
+]

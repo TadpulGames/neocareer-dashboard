@@ -1,0 +1,1222 @@
+export async function GetResult() {
+    StartResultTimer();
+    const jobName = jobNameRoot;
+    const email = emailRoot_firebaseSafe;
+
+    const evaluationFunction = generateEvaluationFunctionFromFirebase(jobName, cachedJobData.Metrics);
+    const response = await OpenAIRequestResult(modifiedResultContext, evaluationFunction);
+
+    await Analytics_TookTimeForResult();
+
+    // 🧩 FIX: response.arguments is already parsed JSON
+    let evaluation = response.arguments;
+
+      // ✅ Fix: handle stringified JSON
+  if (typeof evaluation === "string") {
+    try {
+      evaluation = JSON.parse(evaluation);
+      // console.log("✅ Parsed stringified JSON successfully");
+    } catch (err) {
+      console.error("❌ Failed to parse JSON:", err);
+    }
+  }
+
+// 🧩 Handle possible nested structure
+const parsedEval = evaluation?.criteria_breakdown 
+  ? evaluation 
+  : evaluation?.evaluation 
+    ? evaluation.evaluation 
+    : null;
+
+if (!parsedEval || !parsedEval.criteria_breakdown || !parsedEval.criteria_scores) {
+  console.error("❌ Invalid evaluation format:", evaluation);
+  throw new Error("Evaluation result missing criteria_breakdown or criteria_scores");
+}
+
+        const Results = [];
+        let totalScore = 0;
+        let criteriaCount = 0;
+        const criteriaBreakdown = parsedEval.criteria_breakdown;
+        const criteriaScores = parsedEval.criteria_scores;
+
+        for (const [metricName, feedback] of Object.entries(criteriaBreakdown)) {
+           const score = criteriaScores?.[metricName] ?? 0; 
+
+            Results.push({
+                Feedback: feedback,
+                MetricName: metricName,
+                score: score
+            });
+
+            totalScore += score;
+            criteriaCount++;
+        }
+
+        const overallScore = criteriaCount > 0 ? totalScore / criteriaCount : 0;
+      
+        const resultDocRef = doc(dbRef, companyNameRoot, FIREBASEDOCUMENT.JOBS, jobName, FIREBASESUBDOCUMENT.CANDIDATES, email, FIREBASESUBSUBDOCUMENT.RESULT);
+       
+   
+        const resultDocSnap = await getDoc(resultDocRef);
+       
+        const shouldUploadResults = !resultDocSnap.exists() ||
+            !resultDocSnap.data() ||
+            !resultDocSnap.data().Results ||
+            resultDocSnap.data().Results.length === 0;
+
+        if (shouldUploadResults) {
+             await setDoc(resultDocRef, { Results }, { merge: true });
+
+            const statusRef = doc(dbRef, companyNameRoot, FIREBASEDOCUMENT.JOBS, jobName, FIREBASESUBDOCUMENT.CANDIDATES, email, FIREBASESUBSUBDOCUMENT.STATUS);
+
+            await setDoc(statusRef, { isInterviewFinished: "True" }, { merge: true });
+
+            const tempConversationRef = doc(dbRef, companyNameRoot, FIREBASEDOCUMENT.JOBS, jobNameRoot, FIREBASESUBDOCUMENT.CANDIDATES, email, FIREBASESUBSUBDOCUMENT.TEMPCONVERSATION);
+            const tempConversationDocSnap = await getDoc(tempConversationRef);
+
+            if (tempConversationDocSnap.exists()) {
+                const conversationRef = doc(dbRef, companyNameRoot, FIREBASEDOCUMENT.JOBS, jobNameRoot, FIREBASESUBDOCUMENT.CANDIDATES, email, FIREBASESUBSUBDOCUMENT.CONVERSATION);
+                await setDoc(conversationRef, tempConversationDocSnap.data());
+                await deleteDoc(tempConversationRef);
+            }
+            
+            // Get existing CandidateList entry to preserve terminatedForViolations flag
+            const candidateListRef = doc(dbRef, companyNameRoot, FIREBASEDOCUMENT.CANDIDATELIST, "List", jobName);
+            const candidateListSnap = await getDoc(candidateListRef);
+            let existingTerminationFlag = false;
+
+            if (candidateListSnap.exists()) {
+                const data = candidateListSnap.data();
+                if (data[email] && Array.isArray(data[email]) && data[email].length > 0) {
+                    existingTerminationFlag = data[email][0].terminatedForViolations || false;
+                }
+            }
+
+            userNameRoot = sessionStorage.getItem("candidateName");
+ 
+            CandidateData.CandidateName = userNameRoot;
+            CandidateData.InterviewDate = getCurrentTimeFormat();
+            CandidateData.OverallScore = overallScore;
+            CandidateData.Results = Results;
+            CandidateData.candidateStatusCode = 0;
+
+            // Preserve terminatedForViolations flag if it was set
+            if (existingTerminationFlag) {
+                CandidateData.terminatedForViolations = true;
+            }
+
+            await updateDoc(candidateListRef, { [email]: deleteField() });
+
+            await setDoc(candidateListRef, { [email]: [CandidateData] }, { merge: true });
+            // console.log("✅ CandidateList updated successfully with Results (terminatedForViolations preserved):");
+                await UpdateCredits(jobName);
+
+    }
+}
+
+async function OpenAIRequestResult(systemContext, functionsDef) {
+  try {
+    // console.log("====== OpenAIRequestResult DEBUG START ======");
+
+    const recruiterLanguage = sessionStorage.getItem("recruiterLanguage") || "en";
+    const userLanguage = sessionStorage.getItem("userLanguage") || "en";
+
+
+   const languageNames = {
+  en: "English",
+  ja: "Japanese",
+  ar: "Arabic",
+  vi: "Vietnamese"
+};
+
+const languageRule = `
+You must reply ONLY in ${languageNames[recruiterLanguage]}.
+Always greet and answer in ${languageNames[recruiterLanguage]}.
+Never use English unless interview language is English.
+If Japanese → use Kanji/Kana. If Arabic → use Arabic script.
+`;
+
+ 
+    const messages = [
+      { role: 'system', content: systemContext },
+       { role: "system", content: languageRule },
+      ...ConversationData,
+      {
+        role: "user",
+        content: "The interview has concluded. Please provide ONLY JSON output with the evaluation."
+      }
+    ];
+
+    // 🔍 DEBUG: Log what's being sent
+    // console.log("📤 SENDING TO OPENAI (RESULT GENERATION):");
+    // console.log("   Mode: chat (function calling)");
+    // console.log("   Function: evaluate_interview");
+    // console.log("   Temperature: 0.3");
+    // console.log("\n📨 FULL MESSAGES ARRAY:");
+    // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    // messages.forEach((msg, idx) => {
+    //   console.log(`\n[${idx}] ${msg.role.toUpperCase()}:`);
+    //   console.log(msg.content);
+    //   console.log("─────────────────────────────────────────");
+    // });
+    // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    // console.log("\n📋 FUNCTION DEFINITION:");
+    // console.log(JSON.stringify(functionsDef, null, 2));
+
+    // Get the current auth token
+    const token = await getAuth().currentUser?.getIdToken();
+    
+    if (!token) {
+      throw new Error("Not authenticated - please log in first");
+    }
+    const requestPayload = {
+      data: {
+        messages,
+        mode: "chat",
+        extraParams: {
+          functions: [functionsDef],
+          function_call: { name: "evaluate_interview" },
+          response_format: { type: "json_object" },
+        }
+      }
+    };
+
+    // console.log("\n📦 FULL REQUEST PAYLOAD:");
+    // console.log(JSON.stringify(requestPayload, null, 2));
+
+    const response = await fetch(
+      "https://us-central1-neodonya-authentication.cloudfunctions.net/runOpenAITest",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify(requestPayload)
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("❌ OpenAI API Error:", errorText);
+      throw new Error(`API error: ${response.status} - ${errorText}`);
+    }
+
+    const result = await response.json();
+
+    // console.log("\n📥 RECEIVED FROM OPENAI (RESULT):");
+    // console.log("   Full Response:");
+    // console.log(JSON.stringify(result, null, 2));
+    
+     let reply = result.result?.data?.reply;
+
+     // fallback: extract JSON directly from raw
+    if (!reply && result.result?.data?.raw?.choices?.[0]?.message?.function_call?.arguments) {
+      reply = result.result.data.raw.choices[0].message.function_call.arguments;
+    }
+
+if (!reply) {
+  throw new Error("Invalid response from OpenAI service");
+}
+    
+    // Use robust JSON extractor
+    const args = await extractJSONFromText(result.result.data.reply);
+
+    if (!args) {
+      throw new Error("Failed to parse evaluation result. AI output: " + result.result.data.reply);
+    }
+
+    // console.log("\n✅ PARSED EVALUATION RESULT:");
+    // console.log(JSON.stringify(args, null, 2));
+    // console.log("====== OpenAIRequestResult DEBUG END ======\n");
+
+    // Return object directly, not stringified
+    return { arguments: args };
+  } catch (error) {
+    console.error("❌ Error in OpenAIRequestResult:", error);
+    // console.log("====== OpenAIRequestResult DEBUG END (ERROR) ======\n");
+    throw error;
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+//firebase functions
+
+function getModelForRequest(mode, extraParams = {}) {
+  // Deep reasoning / evaluation / structured output
+  if (
+    extraParams?.functions ||
+    extraParams?.function_call ||
+    extraParams?.response_format
+  ) {
+    return "gpt-5.2";
+  }
+
+  // Normal conversation
+  if (mode === "chat") {
+    return "gpt-5.2-chat-latest";
+  }
+
+  return "gpt-5.2-chat-latest";
+}
+export const runOpenAITest = onRequest(
+  { secrets: [OPENAI_KEY], maxInstances: 20 },
+  async (req, res) => {
+
+    // --- CORS ---
+    const origin = req.headers.origin;
+    const allowedOriginsStr = process.env.ALLOWED_ORIGINS ||
+      "http://localhost:3000, http://localhost:3001, https://neorecruit.web.app, https://neorecruit-admin.web.app, https://neorecruit-admin-stage.web.app, https://neorecruit-stage.web.app, https://neorecruit-admin-stage2.web.app, https://neorecruit-stage2.web.app, https://neorecruit-hr-admin.web.app, https://neorecruit-admin-test.web.app, https://neorecruit-pentesting-admin.web.app, https://neorecruit-pentesting.web.app, https://neorecruit-talent.web.app, https://neorecruit-build3-talent.web.app, https://neodonya-hr.web.app, https://neodonya-hr-react.web.app, https://neodonya-hr-stage.web.app, https://neodonya-hr-stage2.web.app, https://neodonya-recruit.web.app, https://neodonya-recruit-stage.web.app, https://neodonya-recruit-stage2.web.app, https://neo-test1.web.app, https://neo-test-hr.web.app, https://neo-test-candidate.web.app, https://candidate-neorecruit.web.app";
+
+    const allowedOrigins = allowedOriginsStr.split(",").map(s => s.trim());
+    if (origin && allowedOrigins.includes(origin)) {
+      res.set("Access-Control-Allow-Origin", origin);
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.set("Access-Control-Allow-Credentials", "true");
+    }
+
+    if (req.method === "OPTIONS") return res.status(204).send("");
+
+    try {
+      // ---- AUTH ----
+      const authHeader = req.headers.authorization;
+      if (!authHeader?.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "Authentication required" });
+      }
+
+      let userId;
+      try {
+        const idToken = authHeader.split("Bearer ")[1];
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        userId = decoded.uid;
+      } catch {
+        return res.status(401).json({ error: "Authentication failed" });
+      }
+
+      // ---- REQUEST DATA ----
+      const { messages, mode, audio, extraParams } = req.body?.data || {};
+      const apiKey = OPENAI_KEY.value();
+      if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY not found" });
+
+      const voice = extraParams?.voice || "echo";
+
+      // =================================================================
+      //                         TTS MODE
+      // =================================================================
+      if (mode === "tts") {
+        const r = await fetch("https://api.openai.com/v1/audio/speech", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-4o-mini-tts",
+            voice,
+            input: messages.map(m => m.content).join(" ")
+          }),
+        });
+
+        if (!r.ok) {
+          const errorText = await r.text();
+          return res.status(500).json({ error: `TTS failed: ${errorText}` });
+        }
+
+        const buffer = await r.arrayBuffer();
+        return res.status(200).json({
+          result: { data: { audio: Buffer.from(buffer).toString("base64") } },
+        });
+      }
+
+// =================================================================
+//                     TRANSCRIBE MODE  (MIC)
+// =================================================================
+if (mode === "transcribe") {
+  if (!audio) return res.status(400).json({ error: "Audio required" });
+
+  try {
+    const { default: FormDataModule } = await import("form-data");
+    const FormData = FormDataModule;
+    const formData = new FormData();
+
+    // Convert base64 → buffer
+    if (typeof audio === "string") {
+      const base64 = audio.includes("base64,")
+        ? audio.split("base64,")[1]
+        : audio;
+      formData.append("file", Buffer.from(base64, "base64"), {
+        filename: "audio.wav",
+        contentType: "audio/wav",
+      });
+    } else {
+      formData.append("file", audio);
+    }
+
+    formData.append("model", "whisper-1");
+    formData.append("response_format", "verbose_json");
+    formData.append("translate", "false");
+    formData.append("temperature", "0");
+
+    const stt = await fetch(
+      "https://api.openai.com/v1/audio/transcriptions",
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}` },
+        body: formData,
+      }
+    );
+
+    if (!stt.ok) {
+      const errorText = await stt.text();
+      return res
+        .status(500)
+        .json({ error: `Transcription failed: ${errorText}` });
+    }
+
+    const data = await stt.json();
+
+    // Build text from segments (preferred)
+    const originalText = data.segments
+      ? data.segments.map(s => s?.text || "").join(" ").trim()
+      : (data.text || "").trim();
+
+    const target = mapLanguageToCode(extraParams?.userLanguage || "en");
+
+    logger.info("📝 Whisper Result", {
+      detectedByWhisper: data.language,
+      preview: originalText.slice(0, 200),
+      segments: data.segments?.length || 0,
+    });
+
+    // ===============================================================
+    // STEP 0 — ONLY BLOCK REAL SILENCE / MIC TAP
+    // ===============================================================
+    const segmentsCount = Array.isArray(data.segments)
+      ? data.segments.length
+      : 0;
+
+    if (segmentsCount === 0 || !originalText) {
+      return res.status(200).json({
+        result: {
+          data: {
+            text: "",
+            valid: false,
+            silent: true,
+            detectedLanguage: "unknown",
+          },
+        },
+      });
+    }
+
+    // ===============================================================
+    // STEP 1 — Normalize Whisper language
+    // ===============================================================
+    const normalize = (lang) => {
+      if (!lang) return "";
+      const l = lang.toLowerCase();
+      if (["en", "eng", "english"].includes(l)) return "en";
+      if (["ja", "jpn", "japanese"].includes(l)) return "ja";
+      if (["ar", "ara", "arabic"].includes(l)) return "ar";
+      return l;
+    };
+
+    let detected = "";
+
+    if (data.language_probs && Object.keys(data.language_probs).length) {
+      detected = Object.entries(data.language_probs)
+        .sort((a, b) => b[1] - a[1])[0]?.[0];
+      detected = normalize(detected);
+    } else {
+      detected = normalize(data.language);
+    }
+
+    // ===============================================================
+    // STEP 2 — Script-based fallback if Whisper unsure
+    // ===============================================================
+    if (!detected || detected === "und") {
+      if (/[A-Za-z]/.test(originalText)) detected = "en";
+      else if (/[\u0600-\u06FF]/.test(originalText)) detected = "ar";
+      else if (/[\u3040-\u30FF\u31F0-\u31FF]/.test(originalText)) detected = "ja";
+      else detected = target;
+    }
+
+    // ===============================================================
+    // STEP 3 — English interview: ALWAYS accept English text
+    // (single word, fillers, sentences — all allowed)
+    // ===============================================================
+    if (target === "en" && /[A-Za-z]/.test(originalText)) {
+      detected = "en";
+    }
+
+    // ===============================================================
+    // STEP 4 — Wrong language → show warning (no blocking)
+    // ===============================================================
+    if (detected !== target) {
+      return res.status(200).json({
+        result: {
+          data: {
+            text: originalText,
+            valid: false,
+            warning: getLocalAlert(detected, target),
+            detectedLanguage: detected,
+            messageId: Date.now(),
+          },
+        },
+      });
+    }
+
+    // ===============================================================
+    // SUCCESS — PASS EVERYTHING VALID TO GPT
+    // ===============================================================
+    return res.status(200).json({
+      result: {
+        data: {
+          text: originalText,
+          valid: true,
+          detectedLanguage: detected,
+          messageId: Date.now(),
+        },
+      },
+    });
+  } catch (err) {
+    return res
+      .status(500)
+      .json({ error: `Transcription failed: ${err.message}` });
+  }
+}
+
+
+
+      // 🚨⛔ IMPORTANT — IF TRANSCRIBE WAS HIT, WE EXIT ALREADY
+      // OTHERWISE CHAT WILL RUN & CRASH
+      if (mode === "transcribe") return;
+
+
+// =================================================================
+//                  VALIDATE TYPED TEXT MODE
+// =================================================================
+if (mode === "validateText") {
+  const { text, extraParams } = req.body?.data || {};
+  const target = mapLanguageToCode(extraParams?.userLanguage || "en");
+
+  // 1️⃣ Empty / too short → invalid
+  if (!text || text.trim().length < 1) {
+    return res.status(200).json({
+      result: {
+        data: {
+          valid: false,
+          warning: `Please answer in ${extraParams?.userLanguage || "English"}.`,
+          detectedLanguage: "unknown",
+          messageId: Date.now()
+        }
+      }
+    });
+  }
+
+  const t = text.trim();
+
+
+
+// 2️⃣ Detect LANGUAGE using scripts + roman patterns
+function detectFromText(str, target) {
+  const s = str.toLowerCase().trim();
+      const hasLatin = /[a-z]/i.test(s);
+    const wordCount = s.split(/\s+/).filter(Boolean).length;
+
+       logger.info("LANGUAGE DETECTION START", {
+      target,
+      sample: s.slice(0, 80),
+      wordCount,
+      hasLatin
+    });
+
+  // ---------- Script-based (Unicode blocks) ----------
+  if (/[\u0C00-\u0C7F]/.test(s)) return "te";   // Telugu
+  if (/[\u0900-\u097F]/.test(s)) return "hi";   // Hindi/Devanagari
+  if (/[\u0B80-\u0BFF]/.test(s)) return "ta";   // Tamil
+  if (/[\u0D00-\u0D7F]/.test(s)) return "ml";   // Malayalam
+  if (/[\u0C80-\u0CFF]/.test(s)) return "kn";   // Kannada
+  if (/[\u0980-\u09FF]/.test(s)) return "bn";   // Bengali
+  if (/[\u0600-\u06FF]/.test(s)) return "ar";   // Arabic script
+  if (/[\u3040-\u30FF\u4E00-\u9FFF]/.test(s)) return "ja"; // Japanese script
+
+  // ============================================================
+  // 2️⃣ Romanized language rules
+  // ============================================================
+
+    function hit(regex) {
+      return (s.match(regex) || []).length;
+    }
+        const romanRules = {
+      ja: /\b(watashi|anata|kore|sore|desu|masu|arigatou|ohayou|sumimasen|onegaishimasu|douzo|genki|doumo|suki|kirai|nihon|nihongo|sensei|tokoro|youna|yōna|baai|junno|smuuzu|omoshiroi|arimasu|ikimasu)\b/gi,
+      ar: /\b(assalamu|assalam|alsalam|salam|salaam|as-salamu|as-salam|alaikum|alaikom|alaykum|marhaba|marhabaan|marhaba|ahlan|ahlanwasahlan|ahlan-wa-sahlan|sahlan|sahlon|ismi|ismee|shukran|shokran|shukraan|afwan|habibi|habibti|habebti|wallah|walla|allah|allahuma|inshaallah|inshallah|inshAllah|insha-Allah|inshaalla|kaifa|kayfa|keif|keifak|keifik|haluk|halik|halak|sabah|saba|sabahulkhair|sabah-khair|sabahalkhair|masa|masaa|masaaulkhair|masaalkhair|mumkin|momkin|shwaya|shwia|taaban|mafish|mafeesh|mafish|bahibak|bahibik\ behib)\b/gi,
+      te: /\b(naa|nenu|peru|meeru|meeku|mee|naaku|naadi|vadi|vallu|inka|ippudu|cheppu|cheppandi|cheyandi|vaddu|ledu|unnanu|unnadi|bagunnanu|bagunnadi|evaru|emi|emiti|entha|enduku|ekkada|manchi|chala|tappu|sare|aithe)\b/gi,
+      hi: /\b(namaste|namaskar|mujhe|kyun|kaun|kahan|kidhar|batao|samjho|dekho|sunna|bolna|paisa|khana|pani|pyar|dost|bhai|behen)\b/gi,
+      ta: /\b(vanakkam|naan|enna|enaku|ungal|irukiren|iruken|irukka|solren|sollunga|epdi|eppadi|seriya|seri|appadi|romba|nalla|nanri|sapdre|sapdringa|sapten)\b/gi,
+      kn: /\b(nanna|hesaru|yenu|yaake|yelli|hegide|chennagide|illa|haudu|nimage|neenu|swalpa|sari|eshtu|yavaga|yakke|madthiya|madbedi)\b/gi,
+      ml: /\b(njan|ente|enniku|peru|allallo|allatha|anu|alle|ningal|aval|avan|nalla|vallare|poli)\b/gi,
+      bn: /\b(ami|aami|tumi|apni|bhalo|valo|kemon|kamon|achho|acho|achi|ache|ki|kotha|kothay|keno|amader|tomar|amar|bhai|bon)\b/gi
+    };
+
+  if (hasLatin) {
+    for (const [lang, regex] of Object.entries(romanRules)) {
+      const hits = hit(regex);
+
+      const isStrongRoman =
+        (hits >= 2 && wordCount >= 2) || // short but clear
+        (hits >= 1 && wordCount >= 4);   // longer sentence
+
+      if (isStrongRoman) {
+        logger.info("LANGUAGE DETECTED", {
+          detected: lang,
+          reason: "Romanized non-English (guarded)",
+          hits,
+          wordCount
+        });
+        return lang;
+      }
+    }
+  }
+
+      // -----------------------------------------------------------
+    // ✅ 2.3 SHORT ENGLISH ANSWERS (CRITICAL FIX)
+    // -----------------------------------------------------------
+    if (hasLatin && wordCount <= 5) {
+      logger.info("LANGUAGE DETECTED", {
+        detected: "en",
+        reason: "Short English answer",
+        wordCount
+      });
+      return "en";
+    }
+
+    /* ============================================================
+       4️⃣ STRICT ENGLISH INTERVIEW CHECK
+    ============================================================ */
+  const englishIndicators =
+    /\b(the|and|for|with|have|from|that|this|will|your|what|about|which|when|make|just|know|their|would|there|been|more|other|could|should)\b/i;
+
+  if (hasLatin && (englishIndicators.test(s) || wordCount >= 6)) {
+    logger.info("LANGUAGE DETECTED", {
+      detected: "en",
+      reason: englishIndicators.test(s)
+        ? "English indicator words"
+        : "Long English sentence",
+      wordCount
+    });
+    return "en";
+  }
+    /* ============================================================
+       FINAL FALLBACK
+    ============================================================ */
+  logger.info("LANGUAGE FALLBACK", {
+    detected: "unknown",
+    wordCount
+  });
+
+  return "unknown";
+  
+  
+}
+
+
+  const detected = detectFromText(t, target);
+
+  
+
+  // 3️⃣ Mismatch → send warning
+  if (detected !== target) {
+        logger.info("LANGUAGE MISMATCH", {
+      detected,
+      expected: target,
+      inputPreview: t.slice(0, 80)
+    });
+    return res.status(200).json({
+      result: {
+        data: {
+          valid: false,
+          warning: getLocalAlert(detected, target),
+          detectedLanguage: detected,
+           messageId: Date.now()
+        }
+      }
+    });
+  }
+
+  // 4️⃣ Success
+    logger.info("LANGUAGE MATCH SUCCESS", {
+    target,
+    detected
+  });
+  return res.status(200).json({
+    result: {
+      data: {
+        valid: true,
+        detectedLanguage: target,
+         messageId: Date.now()
+      }
+    }
+  });
+}
+
+
+      // =================================================================
+      //                     CHAT COMPLETION (GPT)
+      // =================================================================
+      if (!messages?.length) {
+        return res.status(400).json({ error: "messages[] required" });
+      }
+
+      // =================================================================
+
+      const model = getModelForRequest(mode, extraParams);
+      logger.info("🧠 OpenAI Model Selected", {
+  mode,
+  hasFunctions: !!extraParams?.functions,
+  hasFunctionCall: !!extraParams?.function_call,
+  hasResponseFormat: !!extraParams?.response_format,
+  selectedModel: model,
+});
+      const chatBody = {
+        model,
+        messages,
+        max_completion_tokens: Math.min(6000, 8000)
+      };
+
+      if (extraParams?.userLanguage) {
+        chatBody.messages.unshift({
+          role: "system",
+          content: `You must reply ONLY in ${extraParams.userLanguage}. 
+Always greet and answer in ${extraParams.userLanguage}. 
+Never use English unless ${extraParams.userLanguage} is English.`
+        });
+      }
+
+if (extraParams) {
+  if (extraParams.response_format) chatBody.response_format = extraParams.response_format;
+  if (extraParams.functions) chatBody.functions = extraParams.functions;
+  if (extraParams.function_call) chatBody.function_call = extraParams.function_call;
+
+  // 🚨 temperature NOT allowed for gpt-5.2
+  if (
+    extraParams.temperature &&
+    !model.startsWith("gpt-5.2")
+  ) {
+    chatBody.temperature = extraParams.temperature;
+  }
+}
+
+      // 🚨 AUTO-FIX for LLM-usage check (IMPORTANT)
+// If a function_call is expected but frontend did not add response_format,
+// force JSON output so OpenAI cannot reply in paragraphs.
+if (extraParams?.function_call && !extraParams?.response_format) {
+  chatBody.response_format = { type: "json_object" };
+ 
+}
+
+
+
+      const r = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(chatBody),
+      });
+
+      const d = await r.json();
+      if (!r.ok) {
+        return res.status(500).json({ error: d.error?.message || "OpenAI chat error" });
+      }
+
+      const msg = d.choices?.[0]?.message || {};
+      const reply = msg.content || msg.function_call?.arguments || "";
+
+      return res.status(200).json({
+        result: { data: { reply, raw: d } },
+      });
+
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+export const runOpenAI = onRequest(
+  { secrets: [OPENAI_KEY], maxInstances: 20 },
+  async (req, res) => {
+
+    // --- CORS ---
+    const origin = req.headers.origin;
+    const allowedOriginsStr = process.env.ALLOWED_ORIGINS ||
+      "http://localhost:3000, http://localhost:3001, https://neorecruit.web.app, https://neorecruit-admin.web.app, https://neorecruit-admin-stage.web.app, https://neorecruit-stage.web.app, https://neorecruit-admin-stage2.web.app, https://neorecruit-stage2.web.app, https://neorecruit-hr-admin.web.app, https://neorecruit-admin-test.web.app, https://neorecruit-pentesting-admin.web.app, https://neorecruit-pentesting.web.app, https://neorecruit-talent.web.app, https://neorecruit-build3-talent.web.app, https://neodonya-hr.web.app, https://neodonya-hr-react.web.app, https://neodonya-hr-stage.web.app, https://neodonya-hr-stage2.web.app, https://neodonya-recruit.web.app, https://neodonya-recruit-stage.web.app, https://neodonya-recruit-stage2.web.app, https://neo-test1.web.app, https://neo-test-hr.web.app, https://neo-test-candidate.web.app, https://candidate-neorecruit.web.app";
+
+    const allowedOrigins = allowedOriginsStr.split(",").map(s => s.trim());
+    if (origin && allowedOrigins.includes(origin)) {
+      res.set("Access-Control-Allow-Origin", origin);
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.set("Access-Control-Allow-Credentials", "true");
+    }
+
+    if (req.method === "OPTIONS") return res.status(204).send("");
+
+    try {
+      // ---- AUTH ----
+      const authHeader = req.headers.authorization;
+      if (!authHeader?.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "Authentication required" });
+      }
+
+      let userId;
+      try {
+        const idToken = authHeader.split("Bearer ")[1];
+        const decoded = await admin.auth().verifyIdToken(idToken);
+        userId = decoded.uid;
+      } catch {
+        return res.status(401).json({ error: "Authentication failed" });
+      }
+
+      // ---- REQUEST DATA ----
+      const { messages, mode, audio, extraParams } = req.body?.data || {};
+      const apiKey = OPENAI_KEY.value();
+      if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY not found" });
+
+      const voice = extraParams?.voice || "echo";
+
+      // =================================================================
+      //                         TTS MODE
+      // =================================================================
+      if (mode === "tts") {
+        const r = await fetch("https://api.openai.com/v1/audio/speech", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-4o-mini-tts",
+            voice,
+            input: messages.map(m => m.content).join(" ")
+          }),
+        });
+
+        if (!r.ok) {
+          const errorText = await r.text();
+          return res.status(500).json({ error: `TTS failed: ${errorText}` });
+        }
+
+        const buffer = await r.arrayBuffer();
+        return res.status(200).json({
+          result: { data: { audio: Buffer.from(buffer).toString("base64") } },
+        });
+      }
+
+// =================================================================
+//                     TRANSCRIBE MODE  (MIC)
+// =================================================================
+if (mode === "transcribe") {
+  if (!audio) return res.status(400).json({ error: "Audio required" });
+
+  try {
+    const { default: FormDataModule } = await import("form-data");
+    const FormData = FormDataModule;
+    const formData = new FormData();
+
+    // Convert base64 → buffer
+    if (typeof audio === "string") {
+      const base64 = audio.includes("base64,")
+        ? audio.split("base64,")[1]
+        : audio;
+      formData.append("file", Buffer.from(base64, "base64"), {
+        filename: "audio.wav",
+        contentType: "audio/wav",
+      });
+    } else {
+      formData.append("file", audio);
+    }
+
+    formData.append("model", "whisper-1");
+    formData.append("response_format", "verbose_json");
+    formData.append("translate", "false");
+    formData.append("temperature", "0");
+
+    const stt = await fetch(
+      "https://api.openai.com/v1/audio/transcriptions",
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}` },
+        body: formData,
+      }
+    );
+
+    if (!stt.ok) {
+      const errorText = await stt.text();
+      return res
+        .status(500)
+        .json({ error: `Transcription failed: ${errorText}` });
+    }
+
+    const data = await stt.json();
+
+    // Build text from segments (preferred)
+    const originalText = data.segments
+      ? data.segments.map(s => s?.text || "").join(" ").trim()
+      : (data.text || "").trim();
+
+    const target = mapLanguageToCode(extraParams?.userLanguage || "en");
+
+    logger.info("📝 Whisper Result", {
+      detectedByWhisper: data.language,
+      preview: originalText.slice(0, 200),
+      segments: data.segments?.length || 0,
+    });
+
+    // ===============================================================
+    // STEP 0 — ONLY BLOCK REAL SILENCE / MIC TAP
+    // ===============================================================
+    const segmentsCount = Array.isArray(data.segments)
+      ? data.segments.length
+      : 0;
+
+    if (segmentsCount === 0 || !originalText) {
+      return res.status(200).json({
+        result: {
+          data: {
+            text: "",
+            valid: false,
+            silent: true,
+            detectedLanguage: "unknown",
+          },
+        },
+      });
+    }
+
+    // ===============================================================
+    // STEP 1 — Normalize Whisper language
+    // ===============================================================
+    const normalize = (lang) => {
+      if (!lang) return "";
+      const l = lang.toLowerCase();
+      if (["en", "eng", "english"].includes(l)) return "en";
+      if (["ja", "jpn", "japanese"].includes(l)) return "ja";
+      if (["ar", "ara", "arabic"].includes(l)) return "ar";
+      if (["vi", "vie", "vietnamese"].includes(l)) return "vi";
+      return l;
+    };
+
+    let detected = "";
+
+    if (data.language_probs && Object.keys(data.language_probs).length) {
+      detected = Object.entries(data.language_probs)
+        .sort((a, b) => b[1] - a[1])[0]?.[0];
+      detected = normalize(detected);
+    } else {
+      detected = normalize(data.language);
+    }
+
+    // ===============================================================
+    // STEP 2 — Script-based fallback if Whisper unsure
+    // ===============================================================
+    if (!detected || detected === "und") {
+      if (/[A-Za-z]/.test(originalText)) detected = "en";
+      else if (/[\u0600-\u06FF]/.test(originalText)) detected = "ar";
+      else if (/[\u3040-\u30FF\u31F0-\u31FF]/.test(originalText)) detected = "ja";
+      else if (/[ăâđêôơưáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]/i.test(originalText)) detected = "vi";
+      else detected = target;
+    }
+
+    // ===============================================================
+    // STEP 3 — English interview: ALWAYS accept English text
+    // (single word, fillers, sentences — all allowed)
+    // ===============================================================
+    if (target === "en" && /[A-Za-z]/.test(originalText)) {
+      detected = "en";
+    }
+
+    // ===============================================================
+    // STEP 4 — Wrong language → show warning (no blocking)
+    // ===============================================================
+    if (detected !== target) {
+      return res.status(200).json({
+        result: {
+          data: {
+            text: originalText,
+            valid: false,
+            warning: getLocalAlert(detected, target),
+            detectedLanguage: detected,
+            messageId: Date.now(),
+          },
+        },
+      });
+    }
+
+    // ===============================================================
+    // SUCCESS — PASS EVERYTHING VALID TO GPT
+    // ===============================================================
+    return res.status(200).json({
+      result: {
+        data: {
+          text: originalText,
+          valid: true,
+          detectedLanguage: detected,
+          messageId: Date.now(),
+        },
+      },
+    });
+  } catch (err) {
+    return res
+      .status(500)
+      .json({ error: `Transcription failed: ${err.message}` });
+  }
+}
+
+      // 🚨⛔ IMPORTANT — IF TRANSCRIBE WAS HIT, WE EXIT ALREADY
+      // OTHERWISE CHAT WILL RUN & CRASH
+      if (mode === "transcribe") return;
+
+
+// =================================================================
+//                  VALIDATE TYPED TEXT MODE
+// =================================================================
+if (mode === "validateText") {
+  const { text, extraParams } = req.body?.data || {};
+  const target = mapLanguageToCode(extraParams?.userLanguage || "en");
+
+  // 1️⃣ Empty / too short → invalid
+  if (!text || text.trim().length < 1) {
+    return res.status(200).json({
+      result: {
+        data: {
+          valid: false,
+          warning: `Please answer in ${extraParams?.userLanguage || "English"}.`,
+          detectedLanguage: "unknown",
+          messageId: Date.now()
+        }
+      }
+    });
+  }
+
+  const t = text.trim();
+
+
+
+// 2️⃣ Detect LANGUAGE using scripts + roman patterns
+function detectFromText(str, target) {
+  const s = str.toLowerCase().trim();
+      const hasLatin = /[a-z]/i.test(s);
+    const wordCount = s.split(/\s+/).filter(Boolean).length;
+
+       logger.info("LANGUAGE DETECTION START", {
+      target,
+      sample: s.slice(0, 80),
+      wordCount,
+      hasLatin
+    });
+
+  // ---------- Script-based (Unicode blocks) ----------
+  if (/[\u0C00-\u0C7F]/.test(s)) return "te";   // Telugu
+  if (/[\u0900-\u097F]/.test(s)) return "hi";   // Hindi/Devanagari
+  if (/[\u0B80-\u0BFF]/.test(s)) return "ta";   // Tamil
+  if (/[\u0D00-\u0D7F]/.test(s)) return "ml";   // Malayalam
+  if (/[\u0C80-\u0CFF]/.test(s)) return "kn";   // Kannada
+  if (/[\u0980-\u09FF]/.test(s)) return "bn";   // Bengali
+  if (/[\u0600-\u06FF]/.test(s)) return "ar";   // Arabic script
+  if (/[\u3040-\u30FF\u4E00-\u9FFF]/.test(s)) return "ja"; // Japanese script
+  if (/[ăâđêôơưđ]/i.test(s)) return "vi";
+
+  // 2️⃣ European accents
+  if (/[àâçéèêëîïôûùüÿœ]/i.test(s)) return "fr";
+  if (/[áéíóúñü¿¡]/i.test(s)) return "es";
+
+  // ============================================================
+  // 2️⃣ Romanized language rules
+  // ============================================================
+
+    function hit(regex) {
+      return (s.match(regex) || []).length;
+    }
+        const romanRules = {
+      ja: /\b(watashi|anata|kore|sore|desu|masu|arigatou|ohayou|sumimasen|onegaishimasu|douzo|genki|doumo|suki|kirai|nihon|nihongo|sensei|tokoro|youna|yōna|baai|junno|smuuzu|omoshiroi|arimasu|ikimasu)\b/gi,
+      ar: /\b(assalamu|assalam|alsalam|salam|salaam|as-salamu|as-salam|alaikum|alaikom|alaykum|marhaba|marhabaan|marhaba|ahlan|ahlanwasahlan|ahlan-wa-sahlan|sahlan|sahlon|ismi|ismee|shukran|shokran|shukraan|afwan|habibi|habibti|habebti|wallah|walla|allah|allahuma|inshaallah|inshallah|inshAllah|insha-Allah|inshaalla|kaifa|kayfa|keif|keifak|keifik|haluk|halik|halak|sabah|saba|sabahulkhair|sabah-khair|sabahalkhair|masa|masaa|masaaulkhair|masaalkhair|mumkin|momkin|shwaya|shwia|taaban|mafish|mafeesh|mafish|bahibak|bahibik\ behib)\b/gi,
+      vi: /\b(xin|chao|chào|toi|tôi|bạn|là|minh|mình|khong|không|duoc|được|cảm ơn|rất|nhieu|nhiều|một|này|gì|thế nào|vì sao)\b/gi,
+      te: /\b(naa|nenu|peru|meeru|meeku|mee|naaku|naadi|vadi|vallu|inka|ippudu|cheppu|cheppandi|cheyandi|vaddu|ledu|unnanu|unnadi|bagunnanu|bagunnadi|evaru|emi|emiti|entha|enduku|ekkada|manchi|chala|tappu|sare|aithe)\b/gi,
+      hi: /\b(namaste|namaskar|mujhe|kyun|kaun|kahan|kidhar|batao|samjho|dekho|sunna|bolna|paisa|khana|pani|pyar|dost|bhai|behen)\b/gi,
+      ta: /\b(vanakkam|naan|enna|enaku|ungal|irukiren|iruken|irukka|solren|sollunga|epdi|eppadi|seriya|seri|appadi|romba|nalla|nanri|sapdre|sapdringa|sapten)\b/gi,
+      kn: /\b(nanna|hesaru|yenu|yaake|yelli|hegide|chennagide|illa|haudu|nimage|neenu|swalpa|sari|eshtu|yavaga|yakke|madthiya|madbedi)\b/gi,
+      ml: /\b(njan|ente|enniku|peru|allallo|allatha|anu|alle|ningal|aval|avan|nalla|vallare|poli)\b/gi,
+      bn: /\b(ami|aami|tumi|apni|bhalo|valo|kemon|kamon|achho|acho|achi|ache|ki|kotha|kothay|keno|amader|tomar|amar|bhai|bon)\b/gi
+    };
+
+  if (hasLatin) {
+    for (const [lang, regex] of Object.entries(romanRules)) {
+      const hits = hit(regex);
+
+      const isStrongRoman =
+        (hits >= 2 && wordCount >= 2) || // short but clear
+        (hits >= 1 && wordCount >= 4);   // longer sentence
+
+      if (isStrongRoman) {
+        logger.info("LANGUAGE DETECTED", {
+          detected: lang,
+          reason: "Romanized non-English (guarded)",
+          hits,
+          wordCount
+        });
+        return lang;
+      }
+    }
+  }
+
+      // -----------------------------------------------------------
+    // ✅ 2.3 SHORT ENGLISH ANSWERS (CRITICAL FIX)
+    // -----------------------------------------------------------
+    if (hasLatin && wordCount <= 5) {
+      logger.info("LANGUAGE DETECTED", {
+        detected: "en",
+        reason: "Short English answer",
+        wordCount
+      });
+      return "en";
+    }
+
+    /* ============================================================
+       4️⃣ STRICT ENGLISH INTERVIEW CHECK
+    ============================================================ */
+  const englishIndicators =
+    /\b(the|and|for|with|have|from|that|this|will|your|what|about|which|when|make|just|know|their|would|there|been|more|other|could|should)\b/i;
+
+  if (hasLatin && (englishIndicators.test(s) || wordCount >= 6)) {
+    logger.info("LANGUAGE DETECTED", {
+      detected: "en",
+      reason: englishIndicators.test(s)
+        ? "English indicator words"
+        : "Long English sentence",
+      wordCount
+    });
+    return "en";
+  }
+    /* ============================================================
+       FINAL FALLBACK
+    ============================================================ */
+  logger.info("LANGUAGE FALLBACK", {
+    detected: "unknown",
+    wordCount
+  });
+
+  return "unknown";
+  
+  
+}
+
+
+  const detected = detectFromText(t, target);
+
+  
+
+  // 3️⃣ Mismatch → send warning
+  if (detected !== target) {
+        logger.info("LANGUAGE MISMATCH", {
+      detected,
+      expected: target,
+      inputPreview: t.slice(0, 80)
+    });
+    return res.status(200).json({
+      result: {
+        data: {
+          valid: false,
+          warning: getLocalAlert(detected, target),
+          detectedLanguage: detected,
+           messageId: Date.now()
+        }
+      }
+    });
+  }
+
+  // 4️⃣ Success
+    logger.info("LANGUAGE MATCH SUCCESS", {
+    target,
+    detected
+  });
+  return res.status(200).json({
+    result: {
+      data: {
+        valid: true,
+        detectedLanguage: target,
+         messageId: Date.now()
+      }
+    }
+  });
+}
+
+
+      // =================================================================
+      //                     CHAT COMPLETION (GPT)
+      // =================================================================
+      if (!messages?.length) {
+        return res.status(400).json({ error: "messages[] required" });
+      }
+
+      // =================================================================
+
+
+      const chatBody = {
+        model: "gpt-4o",
+        messages,
+        max_tokens: Math.min(6000, 8000),
+        temperature: 0.7,
+      };
+
+      if (extraParams?.userLanguage) {
+        chatBody.messages.unshift({
+          role: "system",
+          content: `You must reply ONLY in ${extraParams.userLanguage}. 
+Always greet and answer in ${extraParams.userLanguage}. 
+Never use English unless ${extraParams.userLanguage} is English.`
+        });
+      }
+
+      if (extraParams) {
+        if (extraParams.response_format) chatBody.response_format = extraParams.response_format;
+        if (extraParams.functions) chatBody.functions = extraParams.functions;
+        if (extraParams.function_call) chatBody.function_call = extraParams.function_call;
+        if (extraParams.temperature) chatBody.temperature = extraParams.temperature;
+      }
+
+      // 🚨 AUTO-FIX for LLM-usage check (IMPORTANT)
+// If a function_call is expected but frontend did not add response_format,
+// force JSON output so OpenAI cannot reply in paragraphs.
+if (extraParams?.function_call && !extraParams?.response_format) {
+  chatBody.response_format = { type: "json_object" };
+  chatBody.temperature = 0.0; // improves structured JSON reliability
+}
+
+
+
+      const r = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(chatBody),
+      });
+
+      const d = await r.json();
+      if (!r.ok) {
+        return res.status(500).json({ error: d.error?.message || "OpenAI chat error" });
+      }
+
+      const msg = d.choices?.[0]?.message || {};
+      const reply = msg.content || msg.function_call?.arguments || "";
+
+      return res.status(200).json({
+        result: { data: { reply, raw: d } },
+      });
+
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+);
