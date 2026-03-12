@@ -396,7 +396,9 @@ export default function App() {
     const entry     = trackingMap[email];
     const tag       = getTagFromTracking(email, trackingMap, p);
     // addedAt: prefer tracking updatedAt, fall back to profile updatedAt
-    const rawAddedAt = entry?.updatedAt || (p?.updatedAt?.toDate ? p.updatedAt.toDate().toISOString() : p?.updatedAt) || null;
+    const rawAddedAt = p?.updatedAt?.toDate
+  ? p.updatedAt.toDate().toISOString()
+  : p?.updatedAt || null;
     const addedAt    = rawAddedAt;
     const is         = interviewStatus[email] || {};
     const talentDone  = !!is.talentDone;
