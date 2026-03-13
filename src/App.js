@@ -114,6 +114,16 @@ async function loadAllCandidates() {
     } catch (_) {}
   }));
 
+
+const talentDone  = Object.entries(interviewStatus).filter(([,v]) => v.talentDone).map(([e]) => e);
+const pmetricDone = Object.entries(interviewStatus).filter(([,v]) => v.pmetricDone).map(([e]) => e);
+const talentFailed  = emails.filter(e => !interviewStatus[e]?.talentDone);
+const pmetricFailed = emails.filter(e => !interviewStatus[e]?.pmetricDone);
+console.log(`🎤 CandidateTalent done (${talentDone.length}):`,  talentDone);
+console.log(`🧠 Pmetric done (${pmetricDone.length}):`, pmetricDone);
+console.log(`❌ Talent NOT done (${talentFailed.length}) — check these:`, talentFailed.slice(0,20));
+console.log(`❌ Pmetric NOT done (${pmetricFailed.length}) — check these:`, pmetricFailed.slice(0,20));
+
   return { emails, profiles, trackingMap, interviewStatus };
 }
 
@@ -359,6 +369,8 @@ export default function App() {
     return unsub;
   }, [loadData]);
 
+  
+
   const handleLogin = async () => {
     setLoginLoading(true); setLoginError('');
     try {
@@ -421,6 +433,7 @@ export default function App() {
     if (filter === 'talent')  return talentDone;
     if (filter === 'pmetric') return pmetricDone;
     if (filter === 'both')    return talentDone && pmetricDone;
+    
     return true;
   });
 
@@ -536,12 +549,14 @@ export default function App() {
                 <th style={{width:48}}>#</th>
                 <th>Email</th>
                 <th>Status</th>
+                <th>CandidateTalent Status</th>
+                <th>Pmetric Status</th>
                 <th>Email Sent</th>
                 <th>Last Updated</th>
                 <th style={{width:32}}></th>
               </tr></thead>
               <tbody>
-                {pageRows.map(({ email, oi, tag, addedAt }) => {
+                {pageRows.map(({ email, oi, tag, addedAt, talentDone, pmetricDone }) => {
                   const rowCls = tag==='new' ? 'row row-hi row-new' : tag==='updated' ? 'row row-hi row-updated' : 'row row-lo';
                   const avCls  = tag==='new' ? 'avatar av-new' : tag==='updated' ? 'avatar av-updated' : 'avatar av-old';
                   return (
@@ -567,6 +582,16 @@ export default function App() {
                           ? <span className="badge b-updated">↑ Updated</span>
                           : <span className="badge b-old">— Previous</span>}
                       </td>
+                      <td onClick={() => openDetail(email)}>
+  {talentDone
+    ? <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'3px 8px',borderRadius:12,fontSize:11,fontWeight:500,background:'#d1fae5',color:'#059669'}}>✅ Done</span>
+    : <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'3px 8px',borderRadius:12,fontSize:11,fontWeight:500,background:'#1e2d3d',color:'#475569'}}>— Pending</span>}
+</td>
+<td onClick={() => openDetail(email)}>
+  {pmetricDone
+    ? <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'3px 8px',borderRadius:12,fontSize:11,fontWeight:500,background:'#d1fae5',color:'#059669'}}>✅ Done</span>
+    : <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'3px 8px',borderRadius:12,fontSize:11,fontWeight:500,background:'#1e2d3d',color:'#475569'}}>— Pending</span>}
+</td>
                       <td onClick={e => { e.stopPropagation(); emailStatusMap[email] && setJourneyEmail(email); }}>
                         <EmailStatusBadge status={emailStatusMap[email]} />
                       </td>
